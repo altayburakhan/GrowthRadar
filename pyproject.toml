@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "growthradar"
+version = "0.1.0"
+description = "AI Growth Intelligence platform for identifying and scoring high-potential UserGuiding leads."
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.34"]
+groq = ["groq>=0.11"]
+dashboard = ["streamlit>=1.35"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+growthradar = "growthradar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["growthradar*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

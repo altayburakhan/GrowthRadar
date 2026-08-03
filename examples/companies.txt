@@ -1,0 +1,5 @@
+# One company domain or URL per line. Lines starting with # are ignored.
+# Used with: growthradar batch examples/companies.txt
+notion.so
+linear.app
+airtable.com

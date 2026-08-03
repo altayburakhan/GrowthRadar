@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv .venv)",
+      "Bash(curl *)",
+      "Bash(pkill -f \"streamlit run growthradar/dashboard.py\")",
+      "Bash(sudo -n true)",
+      "Bash(dpkg -l)",
+      "Bash(chromium --version)",
+      "Bash(chromium-browser --version)",
+      "Bash(google-chrome --version)",
+      "Bash(/snap/bin/chromium.chromedriver *)",
+      "Bash(/snap/bin/chromium --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --dump-dom https://example.com)",
+      "Bash(rm -rf /tmp/claude-1000/-mnt-c-Users-Burakhan-Desktop-Projects-GrowthRadar/chrome-profile3)",
+      "Bash(mkdir -p /tmp/claude-1000/-mnt-c-Users-Burakhan-Desktop-Projects-GrowthRadar/chrome-profile3)",
+      "Bash(/snap/bin/chromium --allow-pre-commit-input --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-client-side-phishing-detection --disable-default-apps --disable-dev-shm-usage --disable-features=IgnoreDuplicateNavs,Prewarm --disable-gpu --disable-hang-monitor --disable-popup-blocking --disable-prompt-on-repost --disable-sync --enable-automation --enable-logging --headless=new --log-level=0 --no-first-run --no-sandbox --no-service-autorun --password-store=basic --remote-debugging-port=0 --test-type=webdriver --use-mock-keychain --user-data-dir=/tmp/claude-1000/-mnt-c-Users-Burakhan-Desktop-Projects-GrowthRadar/chrome-profile3)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"chrome\")",
+      "Bash(rm -rf /tmp/claude-1000/-mnt-c-Users-Burakhan-Desktop-Projects-GrowthRadar/chrome-profile*)"
+    ]
+  }
+}
