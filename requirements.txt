@@ -1,7 +1,0 @@
-playwright>=1.40
-beautifulsoup4>=4.12
-lxml>=5.2
-pydantic>=2.6
-anthropic>=0.34
-groq>=0.11
-streamlit>=1.35
