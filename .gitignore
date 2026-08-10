@@ -8,3 +8,12 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+evidence/*
+!evidence/.gitkeep
+screenshots/*
+!screenshots/.gitkeep
+logs/*
+!logs/.gitkeep
