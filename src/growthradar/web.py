@@ -240,6 +240,8 @@ _INDEX_HTML = """<!doctype html>
   .bar-fill { height: 100%; background: var(--accent); }
   .recommendation { padding: 12px 14px; background: var(--bg); border-radius: 8px; font-size: 14px; margin: 16px 0; }
   .recommendation.llm { border: 1px solid var(--accent); }
+  .recommendation.competitor { border: 1px solid var(--warm); }
+  .recommendation.existing-customer { border: 1px solid var(--cold); }
   .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 14px; }
   .shots a { display: block; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; text-decoration: none; }
   .shots img { width: 100%; height: 110px; object-fit: cover; display: block; background: var(--bg); }
@@ -323,12 +325,19 @@ function renderReport(data) {
     ? `<div class="errors">Uyarilar:<ul>${data.errors.map(e => `<li>${e}</li>`).join('')}</ul></div>`
     : '';
 
+  const competitorHtml = r.already_userguiding_customer
+    ? `<div class="recommendation existing-customer">🟢 <strong>Zaten UserGuiding musterisi</strong> -- rekabetci bir mesaj degil, hesap yonetimi/upsell konusmasi.</div>`
+    : (r.competitor_tools_detected && r.competitor_tools_detected.length
+        ? `<div class="recommendation competitor">⚠️ <strong>Rakip arac tespit edildi: ${r.competitor_tools_detected.join(', ')}</strong> -- bu sirketin zaten onboarding arac butcesi var. Mesaji "ihtiyacin var mi"ya degil, degistirme/gecise gore kur.</div>`
+        : '');
+
   reportPanel.innerHTML = `
     <div class="panel">
       <div class="report-head">
         <h2>${r.company}</h2>
         ${verdictBadge(r.verdict)}
       </div>
+      ${competitorHtml}
       <dl class="fields">
         <dt>Urun</dt><dd>${r.product_url || '-'}</dd>
         <dt>Kayit tamamlandi</dt><dd>${r.registration_completed ? 'Evet' : 'Hayir'}</dd>
@@ -336,6 +345,7 @@ function renderReport(data) {
         <dt>Onboarding tespit edildi</dt><dd>${r.onboarding_detected ? 'Evet' : 'Hayir'}</dd>
         <dt>Toplanan kanit</dt><dd>${r.evidence_collected}</dd>
         <dt>Teknolojiler</dt><dd>${r.technologies_detected.join(', ') || 'Yok'}</dd>
+        <dt>Rakip arac</dt><dd>${r.competitor_tools_detected.join(', ') || 'Yok'}</dd>
         <dt>Yardim merkezi</dt><dd>${r.help_center_url || 'Bulunamadi'}</dd>
         <dt>Guven skoru</dt><dd>${r.confidence_score.toFixed(1)}/100</dd>
       </dl>

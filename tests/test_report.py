@@ -258,6 +258,79 @@ def test_recommendation_flags_existing_userguiding_customer(config: Config) -> N
     assert "not a sales prospect" in report.final_recommendation
 
 
+def test_competitor_tools_detected_lists_rival_onboarding_tools(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={
+                "detected_tools": [
+                    {"name": "Pendo", "category": "onboarding", "confidence": 0.95},
+                    {"name": "WalkMe", "category": "onboarding", "confidence": 0.95},
+                    # Excluded: analytics category, not an onboarding-tool signal.
+                    {"name": "Google Analytics", "category": "analytics", "confidence": 0.95},
+                ]
+            },
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.competitor_tools_detected == ("Pendo", "WalkMe")
+    assert report.already_userguiding_customer is False
+
+
+def test_competitor_tools_detected_excludes_userguiding_itself(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={"detected_tools": [{"name": "UserGuiding", "confidence": 0.95}]},
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.competitor_tools_detected == ()
+    assert report.already_userguiding_customer is True
+
+
+def test_to_markdown_shows_competitor_callout(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={"detected_tools": [{"name": "Pendo", "confidence": 0.95}]},
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+    report = generate_report("run-1", evidence, score)
+
+    markdown = to_markdown(report)
+
+    assert "Competitor tool(s) detected: Pendo" in markdown
+    assert "switching/replacing" in markdown
+
+
+def test_to_markdown_shows_existing_customer_callout(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={"detected_tools": [{"name": "UserGuiding", "confidence": 0.95}]},
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+    report = generate_report("run-1", evidence, score)
+
+    markdown = to_markdown(report)
+
+    assert "Already a UserGuiding customer" in markdown
+    assert "Competitor tool(s) detected" not in markdown
+
+
 def test_to_markdown_contains_key_fields(config: Config) -> None:
     evidence = [_evidence("registration attempt", visible_ui={"submitted": True})]
     score = score_run("run-1", evidence, config)

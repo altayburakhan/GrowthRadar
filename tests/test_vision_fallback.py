@@ -10,6 +10,7 @@ from growthradar.config import Config
 from growthradar.vision_fallback import (
     _candidate_texts,
     _parse_choice,
+    describe_screenshot,
     suggest_click_target,
 )
 
@@ -147,3 +148,72 @@ def test_suggest_click_target_returns_none_when_model_picks_option_not_offered(
     page.set_content(_CANDIDATES_PAGE)
 
     assert suggest_click_target(page, _vision_config(config)) is None
+
+
+# --- describe_screenshot (llm_summary.py's narrative-enrichment path) -------
+
+
+def test_describe_screenshot_returns_description(
+    tmp_path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"not-a-real-png-but-bytes-are-all-that-matters-here")
+
+    def fake_urlopen(request, timeout: float = 30):  # noqa: ANN001
+        return _FakeResponse(_groq_response("A checklist-style onboarding tour is visible."))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    description = describe_screenshot(str(image_path), "onboarding", _vision_config(config))
+
+    assert description == "A checklist-style onboarding tour is visible."
+
+
+def test_describe_screenshot_strips_think_block(
+    tmp_path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"bytes")
+
+    def fake_urlopen(request, timeout: float = 30):  # noqa: ANN001
+        return _FakeResponse(
+            _groq_response("<think>reasoning about the image</think>\nAn empty dashboard state.")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    description = describe_screenshot(str(image_path), "dashboard", _vision_config(config))
+
+    assert description == "An empty dashboard state."
+
+
+def test_describe_screenshot_returns_none_without_vision_model_configured(
+    tmp_path, config: Config
+) -> None:
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"bytes")
+
+    assert describe_screenshot(str(image_path), "dashboard", config) is None
+
+
+def test_describe_screenshot_returns_none_when_file_missing(config: Config) -> None:
+    assert (
+        describe_screenshot("/nonexistent/path/shot.png", "dashboard", _vision_config(config))
+        is None
+    )
+
+
+def test_describe_screenshot_returns_none_on_network_failure(
+    tmp_path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import urllib.error
+
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"bytes")
+
+    def fake_urlopen(request, timeout: float = 30):  # noqa: ANN001
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert describe_screenshot(str(image_path), "dashboard", _vision_config(config)) is None

@@ -16,6 +16,7 @@ def _evidence(
     label: str,
     *,
     url: str | None = None,
+    screenshot: str | None = None,
     javascript: Any = None,
     visible_ui: Any = None,
     confidence: float | None = None,
@@ -29,7 +30,7 @@ def _evidence(
         timestamp="2026-01-01T00:00:00+00:00",
         label=label,
         url=url,
-        screenshot=None,
+        screenshot=screenshot,
         dom=None,
         javascript=javascript,
         network=None,
@@ -50,8 +51,13 @@ def _score(verdict: str = "hot") -> ScoreResult:
     )
 
 
-def _groq_config(**env: str) -> Config:
-    base = {"GROWTHRADAR_LLM_PROVIDER": "groq", "GROQ_API_KEY": "gsk-test-123", **env}
+def _groq_config(*, groq_vision_model: str = "", **env: str) -> Config:
+    base = {
+        "GROWTHRADAR_LLM_PROVIDER": "groq",
+        "GROQ_API_KEY": "gsk-test-123",
+        "GROQ_VISION_MODEL": groq_vision_model,
+        **env,
+    }
     for key, value in base.items():
         __import__("os").environ[key] = value
     try:
@@ -149,6 +155,135 @@ def test_summarize_evidence_prompt_includes_key_facts(monkeypatch: pytest.Monkey
     assert "Registration completed: True" in prompt
     assert "Pendo (onboarding)" in prompt
     assert "HOT" in prompt
+
+
+def test_summarize_evidence_prompt_flags_competitor_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout: float = 20):  # noqa: ANN001
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={
+                "detected_tools": [{"name": "WalkMe", "category": "onboarding", "confidence": 0.95}]
+            },
+        ),
+    ]
+
+    summarize_evidence(evidence, _score(), _groq_config())
+
+    prompt = captured["body"]["messages"][0]["content"]
+    assert "Already a UserGuiding customer: False" in prompt
+    assert "Competitor onboarding tools detected: WalkMe" in prompt
+
+
+def test_summarize_evidence_prompt_flags_existing_userguiding_customer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout: float = 20):  # noqa: ANN001
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com",
+            javascript={
+                "detected_tools": [
+                    {"name": "UserGuiding", "category": "onboarding", "confidence": 0.95}
+                ]
+            },
+        ),
+    ]
+
+    summarize_evidence(evidence, _score(), _groq_config())
+
+    prompt = captured["body"]["messages"][0]["content"]
+    assert "Already a UserGuiding customer: True" in prompt
+    assert "Competitor onboarding tools detected: none" in prompt
+
+
+def test_summarize_evidence_prompt_includes_screenshot_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dashboard_shot = tmp_path / "dashboard.png"
+    dashboard_shot.write_bytes(b"bytes")
+    updates_shot = tmp_path / "updates.png"
+    updates_shot.write_bytes(b"bytes")
+
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout: float = 20):  # noqa: ANN001
+        body = json.loads(request.data.decode("utf-8"))
+        content = body["messages"][0]["content"]
+        if isinstance(content, list):
+            # A vision call (image_url content block) -- reply differently
+            # per target page so the test can tell them apart in the prompt.
+            is_dashboard = "dashboard" in content[0]["text"]
+            reply = "A guided checklist tour is shown." if is_dashboard else "A changelog entry."
+            return _FakeResponse({"choices": [{"message": {"content": reply}}]})
+        captured["body"] = body
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    evidence = [
+        _evidence(
+            "screenshot: https://acme.com/dashboard",
+            url="https://acme.com/dashboard",
+            screenshot=str(dashboard_shot),
+            visible_ui={"screenshot_kind": "dashboard", "success": True},
+        ),
+        _evidence(
+            "screenshot: https://acme.com/changelog",
+            url="https://acme.com/changelog",
+            screenshot=str(updates_shot),
+            visible_ui={"screenshot_kind": "product_updates", "success": True},
+        ),
+    ]
+
+    summarize_evidence(evidence, _score(), _groq_config(groq_vision_model="qwen/qwen3.6-27b"))
+
+    prompt = captured["body"]["messages"][0]["content"]
+    assert "Dashboard/onboarding screenshot shows: A guided checklist tour is shown." in prompt
+    assert "Product updates screenshot shows: A changelog entry." in prompt
+
+
+def test_summarize_evidence_prompt_omits_screenshot_observations_without_vision_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout: float = 20):  # noqa: ANN001
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    evidence = [
+        _evidence(
+            "screenshot: https://acme.com/dashboard",
+            url="https://acme.com/dashboard",
+            screenshot="/some/path/dashboard.png",
+            visible_ui={"screenshot_kind": "dashboard", "success": True},
+        ),
+    ]
+
+    # No groq_vision_model set -- default _groq_config().
+    summarize_evidence(evidence, _score(), _groq_config())
+
+    prompt = captured["body"]["messages"][0]["content"]
+    assert "screenshot shows" not in prompt
 
 
 def test_record_llm_summary_writes_evidence_on_success(

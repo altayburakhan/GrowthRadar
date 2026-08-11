@@ -54,6 +54,8 @@ class FinalReport:
     partial_run: bool = False
     run_errors: tuple[str, ...] = ()
     llm_summary: str | None = None
+    competitor_tools_detected: tuple[str, ...] = ()
+    already_userguiding_customer: bool = False
 
 
 def _by_label_prefix(evidence: list[Evidence], *prefixes: str) -> list[Evidence]:
@@ -132,6 +134,31 @@ def _technologies_detected(evidence: list[Evidence]) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def _already_userguiding_customer(score: ScoreResult) -> bool:
+    notes = score.onboarding_opportunity.notes
+    return bool(notes) and "not a prospect" in notes[0]
+
+
+def _competitor_tools_detected(evidence: list[Evidence]) -> tuple[str, ...]:
+    """Onboarding-category tools other than UserGuiding itself -- mirrors
+    scoring.py's own "competitor onboarding tool detected" signal, surfaced
+    here by name (not just folded into the flat `technologies_detected`
+    list) so a reader can immediately see *which* rival tool to write their
+    outreach message around, without digging into the score breakdown."""
+    names: set[str] = set()
+    for e in _by_label_prefix(evidence, "js/network:"):
+        if not isinstance(e.javascript, dict):
+            continue
+        for tool in e.javascript.get("detected_tools", []):
+            if tool.get("category", "onboarding") != "onboarding":
+                continue
+            if tool.get("name") == "UserGuiding":
+                continue
+            if tool.get("confidence", 0) >= _CONFIDENT_THRESHOLD:
+                names.add(str(tool.get("name")))
+    return tuple(sorted(names))
+
+
 def _llm_summary(evidence: list[Evidence]) -> str | None:
     """Read back llm_summary.py's recorded evidence, if any. Reading, not
     calling an LLM here, keeps this module's "no I/O, pure function" contract
@@ -146,8 +173,7 @@ def _llm_summary(evidence: list[Evidence]) -> str | None:
 
 
 def _recommendation(score: ScoreResult) -> str:
-    opportunity_notes = score.onboarding_opportunity.notes
-    if opportunity_notes and "not a prospect" in opportunity_notes[0]:
+    if _already_userguiding_customer(score):
         return "Already appears to use UserGuiding -- not a sales prospect."
     return _VERDICT_RECOMMENDATIONS.get(score.verdict, "Insufficient evidence.")
 
@@ -200,6 +226,8 @@ def generate_report(
         onboarding_detected=onboarding_detected,
         evidence_collected=len(evidence),
         technologies_detected=_technologies_detected(evidence),
+        competitor_tools_detected=_competitor_tools_detected(evidence),
+        already_userguiding_customer=_already_userguiding_customer(score),
         product_update_pages=product_update_pages,
         help_center_url=help_center_urls[0] if help_center_urls else None,
         confidence_score=score.overall_score,
@@ -233,6 +261,20 @@ def to_markdown(report: FinalReport) -> str:
         ]
         lines += [f">   - {err}" for err in report.run_errors]
         lines.append("")
+    if report.already_userguiding_customer:
+        lines += [
+            "> 🟢 **Already a UserGuiding customer** -- not a competitive-displacement "
+            "prospect; if reaching out, this is an account-management/upsell "
+            "conversation, not a sales pitch.",
+            "",
+        ]
+    elif report.competitor_tools_detected:
+        lines += [
+            f"> ⚠️ **Competitor tool(s) detected: {', '.join(report.competitor_tools_detected)}** "
+            "-- this company already has onboarding-tool budget and buy-in. Frame outreach "
+            'around switching/replacing, not "do you need this at all".',
+            "",
+        ]
     lines += [
         f"- **Product**: {report.product_url or 'unknown'}",
         f"- **Explored pages**: {len(report.explored_pages)}",

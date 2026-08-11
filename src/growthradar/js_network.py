@@ -1,6 +1,7 @@
 """JavaScript and network inspection: detects known onboarding/product-adoption
-tools (UserGuiding, Pendo, Appcues, WalkMe, Chameleon, Product Fruits, Intercom,
-Shepherd, Intro.js, Driver.js), general analytics/tracking providers (Google
+tools (UserGuiding, Pendo, Appcues, WalkMe, Chameleon, Product Fruits, Userpilot,
+Whatfix, Userflow, Intercom, Shepherd, Intro.js, Driver.js), general analytics/tracking
+providers (Google
 Analytics, Segment, Mixpanel, Amplitude, Hotjar, FullStory -- GRO-28), *and*
 AI chat/assistant widgets (Drift, Zendesk Chat, Ada, Crisp, Tidio, LiveChat,
 HubSpot Chat, Freshchat, Tawk.to) by combining multiple independent signals --
@@ -74,6 +75,15 @@ _ONBOARDING_TOOLS: tuple[ToolSignature, ...] = (
     ToolSignature("WalkMe", ("walkme.com",), ("WalkMeAPI",)),
     ToolSignature("Chameleon", ("trychameleon.com",), ("chmln",)),
     ToolSignature("Product Fruits", ("productfruits.com",), ("productFruits",)),
+    # Not yet verified against a live site actually running these three
+    # (unlike every other signature here) -- script domains/globals are
+    # taken from each vendor's own published embed-script documentation, so
+    # treat as best-effort until confirmed the way UserGuiding/Pendo/etc were.
+    ToolSignature(
+        "Userpilot", ("js.userpilot.io", "userpilot.io"), ("Userpilot", "userpilotSettings")
+    ),
+    ToolSignature("Whatfix", ("whatfix.com",), ("Whatfix", "_wfx_environment")),
+    ToolSignature("Userflow", ("js.userflow.com",), ("userflow", "Userflow")),
     ToolSignature("Intercom", ("intercom.io", "intercomcdn.com"), ("Intercom", "intercomSettings")),
     ToolSignature("Shepherd", ("shepherdjs.dev", "shepherd.js"), ("Shepherd",)),
     ToolSignature("Intro.js", ("introjs.com", "intro.js"), ("introJs",)),

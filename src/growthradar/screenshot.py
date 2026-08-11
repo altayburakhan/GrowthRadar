@@ -1,8 +1,10 @@
 """Timestamped screenshot capture, tied to the evidence store.
 
 Required capture points (per Linear.md "Screenshot Policy"): landing page,
-registration, login, dashboard, every major page, every popup, every onboarding
-experience, empty states, product updates, help center, errors.
+registration, login, dashboard, onboarding experience, product updates, help
+center/guide pages, every popup, empty states, errors -- not every page
+visited during exploration (see exploration.py's `_visit`, which skips the
+capture for pages that don't classify into one of these kinds).
 """
 
 from __future__ import annotations

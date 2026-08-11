@@ -10,6 +10,7 @@ exploration can continue elsewhere (Linear.md "Error Recovery").
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass, replace
 
@@ -36,14 +37,22 @@ MAX_FORM_STEPS = 8
 _MAX_VISION_ATTEMPTS = 2
 _CLAIMED_MARKER = "data-growthradar-filled"
 
-# Ordered most-specific first so a broad pattern (e.g. "name") never claims a
-# field that a more specific pattern (e.g. "first name") should have matched.
+# Ordered most-specific first so a broad pattern (e.g. "first name") is tried
+# before a narrower one could ever mis-claim its field.
 # "fname"/"lname" are deliberately excluded despite being a real convention
 # some forms use: _find_field's fallback selector matches them as a raw CSS
 # attribute substring, and "lname" is itself a substring of "fullname" --
 # a single "Full name" field (name="fullname", e.g. blocksurvey.io) would
 # otherwise get wrongly claimed here as a last-name field before full_name's
 # own pattern ever runs.
+# full_name deliberately excludes a bare "name" keyword: a plain substring
+# check would also match any "<X> Name" organization field (e.g. "Church
+# Name"), wrongly filling it with the person's name instead of the company
+# name. Those fields are left for _fill_unclaimed_generic_name_fields, which
+# runs after this and fills anything still-unclaimed containing the word
+# "name" with identity.company_name -- including a genuinely bare "Name"
+# field with no "full"/"your" qualifier, an accepted tradeoff since that
+# phrasing is rare and the field still gets a plausible, non-empty value.
 _FIELD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("email", ("email",)),
     ("password", ("password", "pwd")),
@@ -52,7 +61,9 @@ _FIELD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("company_name", ("company", "organization", "organisation", "workspace", "business name")),
     ("country", ("country",)),
     ("date_of_birth", ("date of birth", "birth date", "birthday", "dob")),
-    ("full_name", ("full name", "your name", "name")),
+    ("phone", ("phone", "mobile", "telephone")),
+    ("website", ("website", "web site", "url")),
+    ("full_name", ("full name", "your name")),
 )
 
 _SUBMIT_BUTTON_TEXTS: tuple[str, ...] = (
@@ -214,11 +225,18 @@ def _fill_visible_fields(page: Page, identity: Identity) -> int:
         "company_name": identity.company_name,
         "country": identity.country,
         "date_of_birth": identity.date_of_birth,
+        "phone": identity.phone,
+        "website": identity.website,
         "full_name": identity.full_name,
     }
     filled = 0
     for field_key, keywords in _FIELD_PATTERNS:
-        input_type = {"email": "email", "password": "password"}.get(field_key)
+        input_type = {
+            "email": "email",
+            "password": "password",
+            "phone": "tel",
+            "website": "url",
+        }.get(field_key)
         locator = _find_field(page, keywords, input_type=input_type)
         if locator is None:
             continue
@@ -266,6 +284,83 @@ def _fill_unclaimed_empty_selects(page: Page) -> int:
         except PlaywrightError:
             continue
         _claim(select)
+        filled += 1
+    return filled
+
+
+def _input_hint_text(locator: Locator) -> str:
+    """name/id/placeholder/aria-label plus any associated <label>'s text --
+    a broader "what is this field called" signal than _find_field's per-
+    keyword selectors, used by _fill_unclaimed_generic_name_fields to
+    inspect a field it already has a handle on rather than search for one."""
+    try:
+        return str(
+            locator.evaluate(
+                "el => [el.name, el.id, el.placeholder, el.getAttribute('aria-label'), "
+                "(el.labels && el.labels[0] && el.labels[0].innerText) || ''].join(' ')"
+            )
+        )
+    except PlaywrightError:
+        return ""
+
+
+_NAME_WORD_RE = re.compile(r"\bname\b")
+_NAME_QUALIFIER_STRIP_RE = re.compile(r"\b(name|your|full)\b")
+_ALPHA_WORD_RE = re.compile(r"[a-z]{3,}")
+
+
+def _is_bare_name_hint(hint: str) -> bool:
+    """True for a field whose only signal is "Name"/"Your Name"/"Full Name"
+    -- no organization-style qualifier like "Church" or "Company". Stripping
+    "name"/"your"/"full" as whole words and checking what's left tells the
+    two apart: "Church Name" leaves "church" behind, a bare "Name" field
+    leaves nothing. Ambiguous fields default to a person's name (not a
+    company one) -- seen live on Synder's post-"Continue with Email" form
+    (cloudbusinesshq.com): a single "Name" input beside Email/Password, no
+    company field anywhere on screen at all.
+    """
+    residual = _NAME_QUALIFIER_STRIP_RE.sub("", hint)
+    return not _ALPHA_WORD_RE.search(residual)
+
+
+def _fill_unclaimed_generic_name_fields(page: Page, identity: Identity) -> int:
+    """Catch-all for name-shaped fields _FIELD_PATTERNS' fixed keyword lists
+    can't enumerate in advance: organization-style "<Industry> Name" fields
+    ("Church Name", "Clinic Name", ...) get `identity.company_name`; a bare,
+    unqualified "Name" field (see `_is_bare_name_hint`) gets
+    `identity.full_name` instead. By the time this runs, anything
+    _fill_visible_fields' more specific first/last/full-name patterns should
+    have matched is already claimed, so this only reaches fields those
+    patterns didn't recognize. Matching "name" as a whole word (not a plain
+    substring) is deliberate: a compound like "Username" contains "name" as a
+    substring but isn't one -- filling it with a value that can contain a
+    space would break that field's validation, the exact class of error this
+    whole feature exists to avoid. Same low-risk, no-real-world-stake
+    reasoning as _fill_unclaimed_empty_selects.
+    """
+    try:
+        inputs = page.locator('input[type="text"], input:not([type])')
+        count = inputs.count()
+    except PlaywrightError:
+        return 0
+
+    filled = 0
+    for i in range(count):
+        candidate = inputs.nth(i)
+        try:
+            if not candidate.is_visible() or _is_claimed(candidate):
+                continue
+            if candidate.input_value():
+                continue
+        except PlaywrightError:
+            continue
+        hint = _input_hint_text(candidate).lower()
+        if not _NAME_WORD_RE.search(hint):
+            continue
+        value = identity.full_name if _is_bare_name_hint(hint) else identity.company_name
+        if not _set_field_value(candidate, value):
+            continue
+        _claim(candidate)
         filled += 1
     return filled
 
@@ -361,9 +456,22 @@ def _words(text: str) -> set[str]:
     return {w for w in text.lower().split() if w}
 
 
+_OAUTH_PHRASE_RE = re.compile(r"\b(with|via)\b")
+
+
 def _is_oauth_button(locator: Locator) -> bool:
     lowered = _clickable_text(locator).lower()
-    return any(keyword in lowered for keyword in _OAUTH_BUTTON_KEYWORDS)
+    if any(keyword in lowered for keyword in _OAUTH_BUTTON_KEYWORDS):
+        return True
+    # "Sign in/up/continue with/via <provider>" for a provider this project
+    # doesn't (and can't exhaustively) enumerate in _OAUTH_BUTTON_KEYWORDS --
+    # Xero, Intuit, Shopify, Salesforce, ... (seen live on Synder's signup,
+    # reached from cloudbusinesshq.com: "Continue with Xero"/"Sign in with
+    # Intuit" sit right next to the "Continue with Email" button we DO want
+    # to click). Any "with"/"via" phrase not naming email is treated as a
+    # third-party connector -- same enumeration-avoidance reasoning as
+    # _fill_unclaimed_generic_name_fields (GRO-40).
+    return bool(_OAUTH_PHRASE_RE.search(lowered)) and "email" not in lowered
 
 
 # Reuses exploration.py's _SIGNUP_KEYWORDS (imported above) so "what counts as
@@ -460,6 +568,48 @@ _CHOICE_CLICKABLE_SELECTOR = f":is({_CLICKABLE_SELECTOR}):not(nav *, header *, f
 def _is_submit_like(text: str) -> bool:
     words = _words(text)
     return any(_words(t) <= words for t in _SUBMIT_BUTTON_TEXTS)
+
+
+# An auth-method chooser screen (OAuth/SSO/integration connect buttons plus
+# one email option -- seen live on Synder's signup, reached from
+# cloudbusinesshq.com) has no field to fill and no plain submit button
+# either, so without this it would fall through to _click_unclaimed_choice_
+# option and could pick any of the OAuth buttons essentially at random. Tried
+# as its own step, before that generic fallback, so "Continue with Email" is
+# always preferred over "Continue with Xero"/"Sign in with Intuit"/etc.
+_CONTINUE_WITH_EMAIL_KEYWORDS: tuple[str, ...] = (
+    "continue with email",
+    "sign up with email",
+    "sign in with email",
+    "use email",
+    "email instead",
+)
+
+
+def _click_continue_with_email(page: Page) -> bool:
+    try:
+        candidates = page.locator(_CLICKABLE_SELECTOR)
+        count = candidates.count()
+    except PlaywrightError:
+        return False
+
+    for i in range(count):
+        candidate = candidates.nth(i)
+        try:
+            if not candidate.is_visible() or _is_claimed(candidate):
+                continue
+        except PlaywrightError:
+            continue
+        lowered = _clickable_text(candidate).strip().lower()
+        if not any(keyword in lowered for keyword in _CONTINUE_WITH_EMAIL_KEYWORDS):
+            continue
+        try:
+            candidate.click(timeout=3000)
+        except PlaywrightError:
+            continue
+        _claim(candidate)
+        return True
+    return False
 
 
 def _click_unclaimed_choice_option(page: Page) -> bool:
@@ -731,16 +881,29 @@ def _run_registration(
         dismiss_overlays(page)
         filled = _fill_visible_fields(page, identity)
         filled += _fill_unclaimed_empty_selects(page)
+        filled += _fill_unclaimed_generic_name_fields(page, identity)
         checked_boxes = _check_consent_checkboxes(page)
 
         picked = False
+        clicked_email = False
         if filled == 0 and checked_boxes == 0:
-            # Nothing to fill or check -- likely a choice-wizard step (see
-            # _click_unclaimed_choice_option) rather than a plain form.
-            picked = _click_unclaimed_choice_option(page)
+            # Nothing to fill or check -- either an auth-method chooser (see
+            # _click_continue_with_email, tried first so it's always
+            # preferred over an OAuth/SSO button) or a choice-wizard step
+            # (see _click_unclaimed_choice_option) rather than a plain form.
+            clicked_email = _click_continue_with_email(page)
+            if not clicked_email:
+                picked = _click_unclaimed_choice_option(page)
 
-        made_progress = filled > 0 or checked_boxes > 0 or picked
-        clicked = _click_submit(page, allow_reclaim=made_progress)
+        made_progress = filled > 0 or checked_boxes > 0 or picked or clicked_email
+        # Clicking "Continue with Email" only reveals the real form (see
+        # cloudbusinesshq.com/Synder) -- it's still empty. Skip _click_submit
+        # this same iteration so it can't find and click a leftover OAuth
+        # button, or the target site's own submit button, before those
+        # fields are filled on the next iteration; that would submit an
+        # empty form and trigger the exact validation errors this project
+        # exists to avoid.
+        clicked = False if clicked_email else _click_submit(page, allow_reclaim=made_progress)
 
         if not made_progress and not clicked:
             # The DOM-based heuristics above (fill/check/pick/submit) found

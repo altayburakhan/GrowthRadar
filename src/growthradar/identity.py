@@ -102,6 +102,13 @@ _PASSWORD_SYMBOLS = "!@#$%^&*-_"
 # same tradeoff as _select_option_best_effort's country matching.
 _DEFAULT_DATE_OF_BIRTH = "1990-01-01"
 
+# Real-looking US area codes to vary the generated phone number's prefix;
+# the exchange+subscriber block below is always 555-01XX, the range every
+# North American telecom permanently reserves as never assigned to a real
+# subscriber (used in film/TV for exactly this reason) -- so this can never
+# collide with an actual phone number regardless of which area code lands.
+_PHONE_AREA_CODES = ("202", "212", "305", "312", "404", "415", "512", "617", "702", "818")
+
 
 @dataclass(frozen=True)
 class Identity:
@@ -112,6 +119,8 @@ class Identity:
     company_name: str
     country: str
     date_of_birth: str
+    phone: str
+    website: str
 
     @property
     def full_name(self) -> str:
@@ -137,6 +146,21 @@ def generate_password(length: int = 16) -> str:
 
 def generate_company_name() -> str:
     return f"{random.choice(_COMPANY_WORDS)} {random.choice(_COMPANY_SUFFIXES)}"
+
+
+def generate_phone() -> str:
+    """A plausible-looking, never-real US phone number (see _PHONE_AREA_CODES)."""
+    area = random.choice(_PHONE_AREA_CODES)
+    subscriber = random.randint(100, 199)
+    return f"+1-{area}-555-0{subscriber}"
+
+
+def generate_website(company_name: str) -> str:
+    """A syntactically valid URL under example.com/.org/.net -- the TLDs
+    IANA permanently reserves for documentation and testing, so this never
+    resolves to (or gets mistaken for) a real, unrelated site."""
+    slug = "".join(ch for ch in company_name.lower() if ch.isalnum()) or "company"
+    return f"https://{slug}.example.com"
 
 
 def _build_email(first: str, last: str, email_domain: str, email_override: str | None) -> str:
@@ -176,12 +200,15 @@ def generate_identity(
     first = first_name or random.choice(_FIRST_NAMES)
     last = last_name or random.choice(_LAST_NAMES)
     email = _build_email(first, last, email_domain, email_override)
+    resolved_company_name = company_name or generate_company_name()
     return Identity(
         first_name=first,
         last_name=last,
         email=email,
         password=generate_password(),
-        company_name=company_name or generate_company_name(),
+        company_name=resolved_company_name,
         country=country,
         date_of_birth=_DEFAULT_DATE_OF_BIRTH,
+        phone=generate_phone(),
+        website=generate_website(resolved_company_name),
     )

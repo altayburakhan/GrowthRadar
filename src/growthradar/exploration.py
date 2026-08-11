@@ -106,7 +106,11 @@ _KIND_KEYWORDS: tuple[tuple[ScreenshotKind, tuple[str, ...]], ...] = (
         ("onboarding", "welcome to", "getting started", "verify your email", "set up your account"),
     ),
     (ScreenshotKind.DASHBOARD, ("dashboard",)),
-    (ScreenshotKind.HELP_CENTER, ("help center", "help", "support")),
+    # "How it works"/"guide" pages are captured for the same reason as
+    # product updates: they're where a site's own use of a guiding/onboarding
+    # tool (or lack of one) tends to show up, independent of a real support
+    # article.
+    (ScreenshotKind.HELP_CENTER, ("help center", "help", "support", "how it works", "guide")),
     (
         ScreenshotKind.PRODUCT_UPDATES,
         ("product updates", "release notes", "changelog", "what's new"),
@@ -290,9 +294,21 @@ class ExplorationEngine:
             kind = self._initial_kind
         else:
             kind = _screenshot_kind_for(link.text, link.url, link.depth)
-        screenshot_evidence = capture_and_record(
-            page, self.store, self.run_logger.run_id, kind, f"screenshot: {title or link.url}"
-        )
+        # Only screenshot pages worth a human looking at later -- signup,
+        # login, dashboard/onboarding (always captured: depth 0 of the
+        # post-registration crawl forces kind via `initial_kind` above,
+        # regardless of this check), product updates, and "how it
+        # works"/guide pages. Everything else (contact, footer links, feature
+        # sub-pages, ...) still gets full DOM/JS/onboarding-heuristic evidence
+        # collected below -- only the image capture is skipped -- since
+        # screenshotting every visited page was producing dozens of images
+        # per run with signal in only a handful of them.
+        screenshot_path: str | None = None
+        if kind != ScreenshotKind.PAGE:
+            screenshot_evidence = capture_and_record(
+                page, self.store, self.run_logger.run_id, kind, f"screenshot: {title or link.url}"
+            )
+            screenshot_path = screenshot_evidence.screenshot
         collect_and_record(
             page,
             self.store,
@@ -316,7 +332,7 @@ class ExplorationEngine:
             f"onboarding heuristics: {title or link.url}",
             dom=snapshot,
             tool_detections=tool_detections,
-            screenshot=screenshot_evidence.screenshot,
+            screenshot=screenshot_path,
         )
         if onboarding_evidence.confidence is not None and onboarding_evidence.confidence >= 0.75:
             self.run_logger.decision(

@@ -144,7 +144,8 @@ Inspect documentation links.
 
 # Screenshot Policy
 
-Capture screenshots throughout exploration.
+Capture screenshots only for pages worth a human (or the scoring LLM) looking
+at later -- not every page visited during exploration.
 
 Required screenshots:
 
@@ -152,13 +153,18 @@ Required screenshots:
 - Registration
 - Login
 - Dashboard
-- Every major page
-- Every popup
-- Every onboarding experience
-- Empty states
+- Onboarding experience (post-login; always captured regardless of page
+  content, since this is the single most important screenshot for scoring)
 - Product updates
-- Help center
+- Help center / "how it works" / guide pages (where a site's own use of a
+  guiding/onboarding tool tends to show up)
+- Every popup
+- Empty states
 - Errors
+
+Every other visited page (contact, footer links, generic feature sub-pages,
+...) still gets full DOM/JS/onboarding-heuristic evidence collected -- just
+not a screenshot -- so evidence coverage is unaffected.
 
 Store screenshots with timestamps.
 

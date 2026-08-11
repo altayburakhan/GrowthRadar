@@ -299,6 +299,101 @@ def test_fills_date_of_birth_field(tmp_path: Path, page: Page) -> None:
     store.close()
 
 
+# Mirrors a real church-management SaaS signup form: an industry-specific
+# "Church Name"/"Church Website" pair _FIELD_PATTERNS' company_name/website
+# keywords can't enumerate by name, a first/last split, a "Username" field
+# (which must NOT be swept up as a name field -- see _NAME_WORD_RE), a phone
+# field, and an "Administrator Password" field (already covered by the
+# existing substring "password" keyword).
+_FORM_WITH_CHURCH_FIELDS = """
+<html><body>
+<input name="churchName" placeholder="Church Name" />
+<input name="churchWebsite" placeholder="Church Website" />
+<input name="username" placeholder="Username" />
+<input name="firstName" type="text" placeholder="First Name" />
+<input name="lastName" type="text" placeholder="Last Name" />
+<input name="email" type="email" placeholder="Email" />
+<input name="phone" placeholder="Phone" />
+<input name="adminPassword" type="password" placeholder="Administrator Password" />
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+
+def test_fills_industry_specific_name_and_website_fields_with_no_errors(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_FORM_WITH_CHURCH_FIELDS)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(
+        page, store, run_logger, first_name_override="Levent", last_name_override="Aksan"
+    )
+
+    identity = result.identity
+    assert page.locator("input[name=churchName]").input_value() == identity.company_name
+    assert page.locator("input[name=churchWebsite]").input_value() == identity.website
+    assert page.locator("input[name=firstName]").input_value() == "Levent"
+    assert page.locator("input[name=lastName]").input_value() == "Aksan"
+    assert page.locator("input[name=email]").input_value() == identity.email
+    assert page.locator("input[name=phone]").input_value() == identity.phone
+    assert page.locator("input[name=adminPassword]").input_value() == identity.password
+    # "Username" contains "name" as a substring but isn't a name field --
+    # must stay untouched, not filled with a company name (which can
+    # contain a space and would fail that field's validation).
+    assert page.locator("input[name=username]").input_value() == ""
+    assert result.submitted is True
+    store.close()
+
+
+# Mirrors Synder's real signup form (reached from cloudbusinesshq.com): an
+# auth-method chooser with OAuth/SSO/integration buttons plus one "Continue
+# with Email" option. Clicking it reveals -- on the *same* page, no
+# navigation -- a bare "Name"/Email/Password form and a "Sign up" button,
+# while the OAuth buttons stay visible right above it. "Sign up" and
+# "Continue with Xero" both word-subset-match "Continue" in _click_submit, so
+# without _is_oauth_button's with/via rule the wrong one could get clicked.
+_FORM_WITH_OAUTH_CHOOSER_AND_EMAIL_OPTION = """
+<html><body>
+<div id="chooser">
+  <button onclick="document.title='oauth-clicked';">Sign in with Intuit</button>
+  <button onclick="document.title='oauth-clicked';">Continue with Xero</button>
+  <button onclick="document.title='oauth-clicked';">Continue with Google</button>
+  <button onclick="document.getElementById('form').style.display='block';">
+    Continue with Email
+  </button>
+</div>
+<div id="form" style="display:none">
+  <input placeholder="Name" />
+  <input placeholder="Email" />
+  <input type="password" placeholder="Password" />
+  <button onclick="document.title='submitted';">Sign up</button>
+</div>
+</body></html>
+"""
+
+
+def test_prefers_continue_with_email_over_oauth_chooser_buttons(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_WITH_OAUTH_CHOOSER_AND_EMAIL_OPTION)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    identity = result.identity
+    assert page.locator("#form input").nth(1).input_value() == identity.email
+    assert page.locator("#form input").nth(2).input_value() == identity.password
+    # A bare "Name" field with no organization qualifier and no separate
+    # company field anywhere on the page -- the person's name, not
+    # identity.company_name (see _is_bare_name_hint).
+    assert page.locator("#form input").nth(0).input_value() == identity.full_name
+    assert result.submitted is True
+    # Confirms neither Intuit/Xero/Google was ever actually clicked -- if one
+    # had been, this title would be "oauth-clicked" instead and submitted
+    # would still be False, since only the real "Sign up" button sets it.
+    assert page.title() == "submitted"
+    store.close()
+
+
 def test_fills_country_select_dropdown_via_exact_label_match(tmp_path: Path, page: Page) -> None:
     page.set_content(_FORM_WITH_COUNTRY_DROPDOWN)
     store, run_logger = _store_and_logger(tmp_path)

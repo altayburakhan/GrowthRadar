@@ -1,8 +1,15 @@
+import re
 import string
 
 import pytest
 
-from growthradar.identity import generate_company_name, generate_identity, generate_password
+from growthradar.identity import (
+    generate_company_name,
+    generate_identity,
+    generate_password,
+    generate_phone,
+    generate_website,
+)
 
 
 def test_generate_identity_produces_plausible_fields() -> None:
@@ -66,6 +73,29 @@ def test_generate_identity_name_override_used_in_default_email() -> None:
 def test_generate_identity_has_a_date_of_birth() -> None:
     identity = generate_identity()
     assert identity.date_of_birth
+
+
+def test_generate_phone_matches_reserved_fictional_block() -> None:
+    # +1-<area>-555-01XX -- the block North American telecom permanently
+    # reserves as never assigned to a real subscriber.
+    for _ in range(20):
+        assert re.fullmatch(r"\+1-\d{3}-555-01\d{2}", generate_phone())
+
+
+def test_generate_website_builds_url_from_company_name() -> None:
+    website = generate_website("Acme Analytics")
+    assert website == "https://acmeanalytics.example.com"
+
+
+def test_generate_website_falls_back_when_company_name_has_no_alnum_chars() -> None:
+    website = generate_website("!!!")
+    assert website == "https://company.example.com"
+
+
+def test_generate_identity_has_phone_and_website() -> None:
+    identity = generate_identity(company_name="Acme Analytics")
+    assert identity.phone.startswith("+1-")
+    assert identity.website == "https://acmeanalytics.example.com"
 
 
 def test_generate_password_meets_complexity_requirements() -> None:

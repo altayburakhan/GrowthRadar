@@ -1,16 +1,23 @@
-"""Screenshot + vision-LLM fallback for registration steps the DOM-based
-heuristics (fill/check/submit/choice-pick in registration.py) can't handle.
+"""Vision-LLM helpers built on `Config.groq_vision_model`, used in two
+unrelated places:
 
-Only tried as a last resort, when that loop is genuinely stuck (see
-_run_registration): captures the current viewport, lists the visible
-clickable element texts already found by a plain DOM scan, and asks a
-vision-capable Groq model to pick ONE of those texts verbatim -- never a
-free-form answer, never pixel coordinates. The chosen text is then clicked
-through registration.py's own text-matching, so vision only ever narrows
-among candidates the DOM already found; it never concludes or acts alone
-(Linear.md "never conclude from one signal").
+1. `suggest_click_target` -- a registration-step fallback (registration.py)
+   for when the DOM-based heuristics (fill/check/submit/choice-pick) can't
+   handle a stuck step. Only tried as a last resort: captures the current
+   viewport, lists the visible clickable element texts already found by a
+   plain DOM scan, and asks the model to pick ONE of those texts verbatim --
+   never a free-form answer, never pixel coordinates. The chosen text is
+   then clicked through registration.py's own text-matching, so vision only
+   ever narrows among candidates the DOM already found; it never concludes
+   or acts alone (Linear.md "never conclude from one signal").
 
-Skipped -- logged, never raised -- when no vision model is configured
+2. `describe_screenshot` -- a one-sentence visual observation of an
+   already-saved screenshot file (llm_summary.py), purely to enrich its
+   plain-English narrative. Never touches scoring: `scoring.py`'s verdict
+   stays 100% rule-based regardless of what this returns, same guarantee
+   `llm_summary.py` already gives its text-only facts.
+
+Both skip -- logged, never raised -- when no vision model is configured
 (`Config.groq_vision_model` unset) or the request/parse fails for any
 reason. Same isolation pattern as llm_summary.py's Groq call, and the same
 reason it's opt-in with no default model: Groq's vision-capable lineup has
@@ -27,6 +34,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import Error as PlaywrightError
@@ -60,6 +68,12 @@ Candidates:
 {candidates}"""
 
 DEFAULT_CANDIDATE_SELECTOR = 'button, a, [role="button"]'
+
+_DESCRIBE_PROMPT_TEMPLATE = """This is a screenshot of a SaaS product's {page_kind} screen, \
+captured during an automated evaluation for a sales-prospecting tool. In ONE short, concrete \
+sentence, describe the onboarding/product-experience signal a salesperson would notice -- e.g. \
+a guided checklist, an empty/cluttered state, a progress tour, a changelog entry. Describe only \
+what is actually visible in the image; do not speculate or invent anything beyond it."""
 
 
 def _candidate_texts(page: Page, selector: str) -> list[str]:
@@ -111,11 +125,17 @@ def _parse_choice(content: str, candidates: list[str]) -> str | None:
     return choice if choice in candidates else None
 
 
-def _call_groq_vision(image_b64: str, candidates: list[str], config: Config) -> str | None:
-    prompt = _PROMPT_TEMPLATE.format(candidates="\n".join(f"- {c}" for c in candidates))
+def _call_groq_vision_raw(
+    image_b64: str, prompt: str, config: Config, *, max_tokens: int = _MAX_TOKENS
+) -> str | None:
+    """Send one image + text prompt to `config.groq_vision_model`, return the
+    raw response text (not yet stripped of any `<think>` block or otherwise
+    parsed) -- shared by `suggest_click_target` (parses a JSON choice out of
+    it) and `describe_screenshot` (uses it as free text). None on any
+    failure; never raises."""
     payload = {
         "model": config.groq_vision_model,
-        "max_tokens": _MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": [
             {
                 "role": "user",
@@ -153,9 +173,15 @@ def _call_groq_vision(image_b64: str, candidates: list[str], config: Config) -> 
         logger.warning("Groq vision: no choices in response")
         return None
     content = (choices[0].get("message") or {}).get("content")
-    if not content:
+    return str(content) if content else None
+
+
+def _call_groq_vision(image_b64: str, candidates: list[str], config: Config) -> str | None:
+    prompt = _PROMPT_TEMPLATE.format(candidates="\n".join(f"- {c}" for c in candidates))
+    content = _call_groq_vision_raw(image_b64, prompt, config)
+    if content is None:
         return None
-    return _parse_choice(str(content), candidates)
+    return _parse_choice(content, candidates)
 
 
 def suggest_click_target(
@@ -183,3 +209,30 @@ def suggest_click_target(
 
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
     return _call_groq_vision(image_b64, candidates, config)
+
+
+def describe_screenshot(image_path: str, page_kind: str, config: Config) -> str | None:
+    """Ask the configured vision model for a one-sentence description of an
+    already-saved screenshot file, framed for a salesperson reading the
+    final report -- used only to enrich llm_summary.py's narrative, never to
+    influence scoring.py's rule-based verdict. `page_kind` is a short label
+    (e.g. "dashboard", "onboarding", "product updates") folded into the
+    prompt so the model's answer stays specific to what that screen is for.
+    None if unavailable, the file can't be read, or the request fails.
+    Never raises.
+    """
+    if not config.groq_vision_model or not config.groq_api_key:
+        return None
+
+    try:
+        image_bytes = Path(image_path).read_bytes()
+    except OSError as exc:
+        logger.warning("screenshot description: could not read %s: %s", image_path, exc)
+        return None
+
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    prompt = _DESCRIBE_PROMPT_TEMPLATE.format(page_kind=page_kind)
+    content = _call_groq_vision_raw(image_b64, prompt, config)
+    if content is None:
+        return None
+    return _THINK_BLOCK_RE.sub("", content).strip()

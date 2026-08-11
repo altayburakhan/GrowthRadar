@@ -73,6 +73,23 @@ def test_two_signals_gets_solid_confidence(page: Page) -> None:
     assert appcues.confidence == 0.75
 
 
+def test_detects_userpilot_whatfix_and_userflow(page: Page) -> None:
+    page.set_content(
+        "<html><head>"
+        "<script src='https://js.userpilot.io/sdk.js'></script>"
+        "<script src='https://cdn.whatfix.com/loader.js'></script>"
+        "<script src='https://js.userflow.com/userflow.js'></script>"
+        "</head></html>"
+    )
+
+    detections = {d.name: d for d in detect_tools(page, [])}
+
+    assert "Userpilot" in detections
+    assert "Whatfix" in detections
+    assert "Userflow" in detections
+    assert all(d.category == ToolCategory.ONBOARDING for d in detections.values())
+
+
 def test_no_signals_means_no_detection(page: Page) -> None:
     page.set_content("<html><body><h1>Nothing here</h1></body></html>")
 

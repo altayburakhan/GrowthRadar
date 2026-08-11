@@ -53,7 +53,11 @@
       "Bash(echo \"started with pid $!\")",
       "Bash(.venv/bin/mypy src/growthradar/registration.py)",
       "Bash(git check-ignore *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(.venv/bin/mypy src/growthradar/vision_fallback.py)",
+      "Bash(.venv/bin/mypy src/growthradar/identity.py)",
+      "Bash(.venv/bin/ruff format *)"
     ]
   }
 }
