@@ -30,7 +30,8 @@ from growthradar.config import Config
 from growthradar.evidence import EvidenceStore
 from growthradar.history import RunHistoryStore
 from growthradar.orchestrator import RunOutcome, run_growthradar_session
-from growthradar.report import to_dict
+from growthradar.report import generate_report, to_dict
+from growthradar.scoring import score_run
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,32 @@ def _screenshots_for_run(config: Config, run_id: str) -> list[dict[str, Any]]:
     return shots
 
 
+def _run_from_evidence(config: Config, run_id: str) -> dict[str, Any] | None:
+    # Fallback for history entries: `_jobs` is an in-memory, per-process
+    # registry (see module docstring), so it never has anything for a run
+    # started before the current server process -- a previous dashboard
+    # session, or any run kicked off via the CLI. `score_run`/`generate_report`
+    # are pure functions over an evidence list (report.py), so a past run's
+    # report is a straight recompute from what's already persisted, not new
+    # data collection. None (not a 404 here) if there's truly no evidence,
+    # so the caller can 404.
+    with EvidenceStore.from_config(config) as store:
+        evidence = store.for_run(run_id)
+    if not evidence:
+        return None
+    score = score_run(run_id, evidence, config)
+    report = generate_report(run_id, evidence, score)
+    return {
+        "run_id": run_id,
+        "url": report.product_url,
+        "status": "done",
+        "started_at": evidence[0].timestamp,
+        "report": to_dict(report),
+        "errors": [],
+        "screenshots": _screenshots_for_run(config, run_id),
+    }
+
+
 class StartRunRequest(BaseModel):
     url: str
     max_pages: int | None = None
@@ -154,7 +181,11 @@ def create_app() -> FastAPI:
         with _jobs_lock:
             job = _jobs.get(run_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="run not found")
+            config = Config.from_env()
+            fallback = _run_from_evidence(config, run_id)
+            if fallback is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return fallback
 
         payload: dict[str, Any] = {
             "run_id": job.run_id,
@@ -261,8 +292,10 @@ _INDEX_HTML = """<!doctype html>
   .history-item {
     display: flex; justify-content: space-between; gap: 10px; padding: 8px 0;
     border-bottom: 1px solid var(--border); font-size: 13px;
+    cursor: pointer;
   }
   .history-item:last-child { border-bottom: none; }
+  .history-item:hover { background: var(--bg); }
   .history-item .company { font-weight: 600; }
   .history-item .url { color: var(--muted); }
   .empty { color: var(--muted); font-size: 13px; }
@@ -435,6 +468,27 @@ async function startRun() {
   poll(data.run_id);
 }
 
+async function viewRun(runId) {
+  if (pollTimer) { clearInterval(pollTimer); }
+  startBtn.disabled = false;
+  reportPanel.innerHTML = '';
+  statusLine.classList.add('active');
+  statusLine.innerHTML = `<span class="spinner"></span>Yukleniyor...`;
+
+  const res = await fetch(`/api/runs/${runId}`);
+  if (!res.ok) {
+    statusLine.innerHTML = 'Bu calisma bulunamadi.';
+    return;
+  }
+  const data = await res.json();
+  if (data.status === 'error') {
+    statusLine.innerHTML = `Basarisiz: ${data.error || 'bilinmeyen hata'}`;
+    return;
+  }
+  statusLine.innerHTML = 'Tamamlandi.';
+  renderReport(data);
+}
+
 async function loadHistory() {
   const res = await fetch('/api/history');
   const rows = await res.json();
@@ -443,10 +497,13 @@ async function loadHistory() {
     return;
   }
   historyList.innerHTML = rows.map(r => `
-    <div class="history-item">
+    <div class="history-item" data-run-id="${r.run_id}">
       <div><span class="company">${r.company}</span> <span class="url">${r.product_url}</span></div>
       <div>${verdictBadge(r.verdict)} ${r.overall_score.toFixed(1)}</div>
     </div>`).join('');
+  historyList.querySelectorAll('.history-item').forEach(el => {
+    el.addEventListener('click', () => viewRun(el.dataset.runId));
+  });
 }
 
 startBtn.addEventListener('click', startRun);
