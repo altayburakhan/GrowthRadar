@@ -340,6 +340,10 @@ function renderReport(data) {
         ? `<div class="recommendation competitor">⚠️ <strong>Rakip arac tespit edildi: ${r.competitor_tools_detected.join(', ')}</strong> -- bu sirketin zaten onboarding arac butcesi var. Mesaji "ihtiyacin var mi"ya degil, degistirme/gecise gore kur.</div>`
         : '');
 
+  const emailVerificationHtml = r.email_verification_required
+    ? `<div class="recommendation competitor">✉️ <strong>Bu site email dogrulamasi istiyor</strong> -- kayit formu dolduruldu ama hesap, gercek bir gelen kutusundaki linke tiklanmadan aktif olmuyor; otomatik akis burada duruyor.</div>`
+    : '';
+
   reportPanel.innerHTML = `
     <div class="panel">
       <div class="report-head">
@@ -347,9 +351,11 @@ function renderReport(data) {
         ${verdictBadge(r.verdict)}
       </div>
       ${competitorHtml}
+      ${emailVerificationHtml}
       <dl class="fields">
         <dt>Urun</dt><dd>${r.product_url || '-'}</dd>
         <dt>Kayit tamamlandi</dt><dd>${r.registration_completed ? 'Evet' : 'Hayir'}</dd>
+        <dt>Email dogrulama gerekiyor</dt><dd>${r.email_verification_required ? 'Evet' : 'Hayir'}</dd>
         <dt>Deneme surumu</dt><dd>${r.trial_available ? 'Var' : 'Yok'}</dd>
         <dt>Onboarding tespit edildi</dt><dd>${r.onboarding_detected ? 'Evet' : 'Hayir'}</dd>
         <dt>Toplanan kanit</dt><dd>${r.evidence_collected}</dd>

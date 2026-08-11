@@ -2,9 +2,9 @@
 
 Turns a run's evidence (GRO-8) plus its ScoreResult (GRO-16) into the fields
 Linear.md's "Final Report" section calls for -- Company, Product, Explored
-pages, Registration completed, Trial available, Onboarding detected, Evidence
-collected, Technologies detected, Product update pages, Help center,
-Confidence score, Final recommendation.
+pages, Registration completed, Email verification required, Trial available,
+Onboarding detected, Evidence collected, Technologies detected, Product
+update pages, Help center, Confidence score, Final recommendation.
 
 `generate_report` is a pure function: it only reads evidence/score already
 computed by earlier stages, never fetches anything new (Linear.md: "Evidence
@@ -56,6 +56,7 @@ class FinalReport:
     llm_summary: str | None = None
     competitor_tools_detected: tuple[str, ...] = ()
     already_userguiding_customer: bool = False
+    email_verification_required: bool = False
 
 
 def _by_label_prefix(evidence: list[Evidence], *prefixes: str) -> list[Evidence]:
@@ -197,9 +198,14 @@ def generate_report(
     dom_pages = [e for e in _by_label_prefix(evidence, "dom:") if e.url]
     screenshots = _by_label_prefix(evidence, "screenshot:")
     onboarding_evidence = _by_label_prefix(evidence, "onboarding heuristics:")
+    registration_attempts = _by_label_prefix(evidence, "registration attempt")
     registration_completed = any(
         isinstance(e.visible_ui, dict) and e.visible_ui.get("submitted") is True
-        for e in _by_label_prefix(evidence, "registration attempt")
+        for e in registration_attempts
+    )
+    email_verification_required = any(
+        isinstance(e.visible_ui, dict) and e.visible_ui.get("email_verification_required") is True
+        for e in registration_attempts
     )
     onboarding_detected = any(
         (e.confidence or 0) >= _CONFIDENT_THRESHOLD for e in onboarding_evidence
@@ -222,6 +228,7 @@ def generate_report(
         product_url=product_url,
         explored_pages=_unique_urls(dom_pages),
         registration_completed=registration_completed,
+        email_verification_required=email_verification_required,
         trial_available=_trial_available(evidence),
         onboarding_detected=onboarding_detected,
         evidence_collected=len(evidence),
@@ -279,6 +286,8 @@ def to_markdown(report: FinalReport) -> str:
         f"- **Product**: {report.product_url or 'unknown'}",
         f"- **Explored pages**: {len(report.explored_pages)}",
         f"- **Registration completed**: {'Yes' if report.registration_completed else 'No'}",
+        "- **Email verification required**: "
+        f"{'Yes' if report.email_verification_required else 'No'}",
         f"- **Trial available**: {'Yes' if report.trial_available else 'No'}",
         f"- **Onboarding detected**: {'Yes' if report.onboarding_detected else 'No'}",
         f"- **Evidence collected**: {report.evidence_collected}",

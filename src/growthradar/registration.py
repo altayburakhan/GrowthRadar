@@ -150,6 +150,7 @@ class RegistrationResult:
     steps_completed: int
     submitted: bool
     verification_link_opened: bool
+    email_verification_required: bool = False
     error: str | None = None
 
 
@@ -760,6 +761,35 @@ def _captcha_challenge_visible(page: Page) -> bool:
     return False
 
 
+# "Verify your email"/"Check your email"-style gates block further progress
+# just as completely as a CAPTCHA -- there's no automated way to open a link
+# sitting in a real inbox from here (registration.py's TempEmailProvider path
+# only fires when a caller explicitly supplies one; the orchestrator doesn't
+# wire one in for the real GROWTHRADAR_EMAIL flow). Detected by phrase, not
+# by a specific selector, since this is arbitrary site copy rather than a
+# recognizable third-party widget.
+_EMAIL_VERIFICATION_PHRASES: tuple[str, ...] = (
+    "verify your email",
+    "confirm your email",
+    "check your email",
+    "verify your account",
+    "confirm your account",
+    "verification email",
+    "we sent you a link",
+    "we've sent you a link",
+    "click the link we sent",
+    "click the link in your email",
+)
+
+
+def _email_verification_required(page: Page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000).lower()
+    except PlaywrightError:
+        return False
+    return any(phrase in body_text for phrase in _EMAIL_VERIFICATION_PHRASES)
+
+
 def _click_by_exact_text(page: Page, text: str) -> bool:
     """Click the visible, unclaimed clickable element whose text exactly
     matches `text` -- used only for a vision-fallback suggestion (see
@@ -1033,6 +1063,7 @@ def _run_registration(
     submitted = False
     vision_attempts = 0
     empty_retries = 0
+    email_verification_required = False
     for _ in range(max_steps):
         dismiss_overlays(page)
 
@@ -1098,6 +1129,30 @@ def _run_registration(
                 page.wait_for_timeout(_EMPTY_RETRY_WAIT_MS)
                 continue
 
+            if _email_verification_required(page):
+                # Checked only once genuinely stuck (nothing left to fill or
+                # click), not on every iteration -- the trigger phrases
+                # ("verification email", "confirm your account", ...) can
+                # also show up as ordinary marketing copy on a signup page
+                # that's still fully fillable, and checking unconditionally
+                # would abort registration before it even started. Same dead
+                # end as a CAPTCHA otherwise: we can't open a link sitting in
+                # a real inbox from here. Recorded as its own distinct
+                # evidence/flag (not lumped in with a generic "stuck"
+                # screenshot) so the dashboard can call this out
+                # specifically, and skips the vision fallback below since
+                # there's nothing useful it could point at either.
+                email_verification_required = True
+                run_logger.action("registration_pending_email_verification", url=page.url)
+                capture_and_record(
+                    page,
+                    store,
+                    run_logger.run_id,
+                    ScreenshotKind.REGISTRATION,
+                    "registration pending email verification",
+                )
+                break
+
             # The DOM-based heuristics above (fill/check/pick/submit) found
             # nothing at all -- genuinely stuck. Screenshot the page and ask
             # a vision-capable LLM to point at one of the same clickable
@@ -1151,6 +1206,7 @@ def _run_registration(
             "steps_completed": steps_completed,
             "submitted": submitted,
             "verification_link_opened": verification_opened,
+            "email_verification_required": email_verification_required,
             "email": identity.email,
             "company_name": identity.company_name,
             "country": identity.country,
@@ -1162,6 +1218,7 @@ def _run_registration(
         steps_completed=steps_completed,
         submitted=submitted,
         verification_link_opened=verification_opened,
+        email_verification_required=email_verification_required,
     )
 
 

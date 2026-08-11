@@ -72,6 +72,27 @@ def test_candidate_texts_dedupes_skips_hidden_and_overlong(page: Page) -> None:
     assert texts == ["Companies", "Advisors"]
 
 
+_CANDIDATES_PAGE_WITH_DEMO_BUTTON = """
+<html><body>
+<button>Sign up</button>
+<button>Book a Demo</button>
+<button>Request a demo</button>
+</body></html>
+"""
+
+
+def test_candidate_texts_excludes_demo_booking_buttons(page: Page) -> None:
+    # "Book a Demo"/"Request a demo" lead to scheduling a live sales call,
+    # not a self-serve trial signup -- never something vision should be
+    # offered as a click target (digifabster.com/getstarted/ has exactly
+    # this button next to the real "Start a free trial" one).
+    page.set_content(_CANDIDATES_PAGE_WITH_DEMO_BUTTON)
+
+    texts = _candidate_texts(page, 'button, a, [role="button"]')
+
+    assert texts == ["Sign up"]
+
+
 def test_parse_choice_strips_think_block_and_extracts_json() -> None:
     content = (
         "<think>The user wants me to pick an option. I'll pick Companies.</think>\n"

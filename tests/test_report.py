@@ -62,6 +62,29 @@ def test_company_name_prefers_registration_evidence(config: Config) -> None:
     assert report.registration_completed is True
 
 
+def test_flags_email_verification_required_from_registration_evidence(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "registration attempt",
+            visible_ui={"submitted": True, "email_verification_required": True},
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.email_verification_required is True
+
+
+def test_email_verification_required_defaults_false_without_the_signal(config: Config) -> None:
+    evidence = [_evidence("registration attempt", visible_ui={"submitted": True})]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.email_verification_required is False
+
+
 def test_company_name_falls_back_to_domain(config: Config) -> None:
     evidence = [
         _evidence(

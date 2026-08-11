@@ -1035,3 +1035,45 @@ def test_retries_before_giving_up_on_a_lazily_loaded_form(tmp_path: Path, page: 
     assert result.submitted is True
     assert page.title() == "submitted"
     store.close()
+
+
+# --- Email verification gate (user-requested: flag it, never guess a link) --
+
+# Mirrors a common post-signup gate: the form submits fine, but the account
+# isn't usable until a link in a real inbox is clicked -- something this
+# project can't do on its own (see registration.py's TempEmailProvider note).
+_FORM_THEN_EMAIL_VERIFICATION_GATE = """
+<html><body>
+<div id="form">
+  <input type="email" placeholder="Email" />
+  <input type="password" placeholder="Password" />
+  <button onclick="
+    document.getElementById('form').style.display='none';
+    document.getElementById('verify').style.display='block';
+  ">Sign up</button>
+</div>
+<div id="verify" style="display:none">
+  <h2>Check your email</h2>
+  <p>We sent you a link to verify your account. Please check your email to confirm your account.</p>
+</div>
+</body></html>
+"""
+
+
+def test_flags_email_verification_gate_and_stops(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_THEN_EMAIL_VERIFICATION_GATE)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, max_steps=5)
+
+    assert result.submitted is True
+    assert result.email_verification_required is True
+
+    evidence = store.for_run(run_logger.run_id)
+    verify_shots = [e for e in evidence if e.label == "registration pending email verification"]
+    assert len(verify_shots) == 1
+    assert verify_shots[0].screenshot is not None
+
+    attempt = next(e for e in evidence if e.label == "registration attempt")
+    assert attempt.visible_ui["email_verification_required"] is True
+    store.close()

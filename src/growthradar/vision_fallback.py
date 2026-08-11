@@ -69,6 +69,16 @@ Candidates:
 
 DEFAULT_CANDIDATE_SELECTOR = 'button, a, [role="button"]'
 
+# "Book a Demo"/"Request a Demo"-style CTAs lead to scheduling a live sales
+# call, not a self-serve trial signup -- never something we want to click.
+# registration.py's own DOM-based choice-wizard fallback already excludes
+# these via _CHOICE_EXCLUDE_KEYWORDS, but vision's candidate list is
+# gathered independently (no shared exclusion list -- importing one from the
+# other would be circular, since registration.py already imports from this
+# module) and had no such filter, so a stuck step could still have the model
+# pick a demo-booking button off the screenshot.
+_EXCLUDED_CANDIDATE_KEYWORDS: tuple[str, ...] = ("demo",)
+
 _DESCRIBE_PROMPT_TEMPLATE = """This is a screenshot of a SaaS product's {page_kind} screen, \
 captured during an automated evaluation for a sales-prospecting tool. In ONE short, concrete \
 sentence, describe the onboarding/product-experience signal a salesperson would notice -- e.g. \
@@ -100,6 +110,9 @@ def _candidate_texts(page: Page, selector: str) -> list[str]:
         except PlaywrightError:
             continue
         if not text or len(text) > _MAX_CANDIDATE_TEXT_LEN or text in seen:
+            continue
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in _EXCLUDED_CANDIDATE_KEYWORDS):
             continue
         seen.add(text)
         texts.append(text)
