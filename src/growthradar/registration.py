@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import partial
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Locator, Page
+from playwright.sync_api import Frame, Locator, Page
 
 from growthradar.browser import dismiss_overlays, retry, wait_for_stable
 from growthradar.config import Config
@@ -171,15 +173,15 @@ def _visible_unclaimed(locator: Locator) -> Locator | None:
 
 
 def _find_field(
-    page: Page, keywords: tuple[str, ...], *, input_type: str | None = None
+    frame: Frame, keywords: tuple[str, ...], *, input_type: str | None = None
 ) -> Locator | None:
     if input_type:
-        candidate = _visible_unclaimed(page.locator(f'input[type="{input_type}"]'))
+        candidate = _visible_unclaimed(frame.locator(f'input[type="{input_type}"]'))
         if candidate is not None:
             return candidate
 
     for keyword in keywords:
-        candidate = _visible_unclaimed(page.get_by_label(keyword, exact=False))
+        candidate = _visible_unclaimed(frame.get_by_label(keyword, exact=False))
         if candidate is not None:
             return candidate
 
@@ -189,7 +191,7 @@ def _find_field(
             f'select[name*="{keyword}" i], select[id*="{keyword}" i], '
             f'select[aria-label*="{keyword}" i]'
         )
-        candidate = _visible_unclaimed(page.locator(selector))
+        candidate = _visible_unclaimed(frame.locator(selector))
         if candidate is not None:
             return candidate
 
@@ -236,7 +238,7 @@ def _set_field_value(locator: Locator, value: str) -> bool:
         return False
 
 
-def _fill_visible_fields(page: Page, identity: Identity) -> int:
+def _fill_visible_fields(frame: Frame, identity: Identity) -> int:
     values = {
         "email": identity.email,
         "password": identity.password,
@@ -260,7 +262,7 @@ def _fill_visible_fields(page: Page, identity: Identity) -> int:
             "phone": "tel",
             "website": "url",
         }.get(field_key)
-        locator = _find_field(page, keywords, input_type=input_type)
+        locator = _find_field(frame, keywords, input_type=input_type)
         if locator is None:
             continue
         if not _set_field_value(locator, values[field_key]):
@@ -270,7 +272,7 @@ def _fill_visible_fields(page: Page, identity: Identity) -> int:
     return filled
 
 
-def _fill_unclaimed_empty_selects(page: Page) -> int:
+def _fill_unclaimed_empty_selects(frame: Frame) -> int:
     """Some forms have a <select> with no mapping to our identity data --
     e.g. "How did you hear about us?" -- left at its empty placeholder value.
     Many such fields are validated as required via JS rather than the HTML
@@ -281,7 +283,7 @@ def _fill_unclaimed_empty_selects(page: Page) -> int:
     generated identity with no real-world stake in the answer.
     """
     try:
-        selects = page.locator("select")
+        selects = frame.locator("select")
         count = selects.count()
     except PlaywrightError:
         return 0
@@ -369,7 +371,7 @@ def _is_bare_name_hint(hint: str) -> bool:
     return not _ALPHA_WORD_RE.search(residual)
 
 
-def _fill_unclaimed_generic_name_fields(page: Page, identity: Identity) -> int:
+def _fill_unclaimed_generic_name_fields(frame: Frame, identity: Identity) -> int:
     """Catch-all for name-shaped fields _FIELD_PATTERNS' fixed keyword lists
     can't enumerate in advance: organization-style "<Industry> Name" fields
     ("Church Name", "Clinic Name", ...) get `identity.company_name`; a bare,
@@ -385,7 +387,7 @@ def _fill_unclaimed_generic_name_fields(page: Page, identity: Identity) -> int:
     reasoning as _fill_unclaimed_empty_selects.
     """
     try:
-        inputs = page.locator('input[type="text"], input:not([type])')
+        inputs = frame.locator('input[type="text"], input:not([type])')
         count = inputs.count()
     except PlaywrightError:
         return 0
@@ -437,7 +439,7 @@ def _is_checkbox_checked(box: Locator, *, native: bool) -> bool:
         return True
 
 
-def _check_consent_checkboxes(page: Page) -> int:
+def _check_consent_checkboxes(frame: Frame) -> int:
     """Check unchecked, visible checkboxes that look like a mandatory
     "I agree to the Terms/Privacy Policy" consent gate -- common on signup
     forms and not always marked HTML `required` (seen on trial.signinapp.com),
@@ -453,7 +455,7 @@ def _check_consent_checkboxes(page: Page) -> int:
     two need different check-state and click strategies).
     """
     try:
-        boxes = page.locator('input[type="checkbox"], [role="checkbox"]')
+        boxes = frame.locator('input[type="checkbox"], [role="checkbox"]')
         count = boxes.count()
     except PlaywrightError:
         return 0
@@ -528,7 +530,7 @@ _LOGIN_KEYWORDS: tuple[str, ...] = ("log in", "login", "sign in")
 _CLICKABLE_SELECTOR = 'button, a, [role="button"]'
 
 
-def _click_submit(page: Page, *, allow_reclaim: bool = False) -> bool:
+def _click_submit(frame: Frame, *, allow_reclaim: bool = False) -> bool:
     # A CSS selector, not get_by_role(name=..., exact=False): Playwright's
     # substring matching there requires our target phrase to appear as an
     # unbroken run of words in the element's accessible name, which fails on
@@ -537,7 +539,7 @@ def _click_submit(page: Page, *, allow_reclaim: bool = False) -> bool:
     # (every word of our phrase present, in any order/position) is more
     # forgiving without being so loose it clicks unrelated buttons.
     try:
-        candidates = page.locator(
+        candidates = frame.locator(
             'button, a, input[type="submit"], input[type="button"], [role="button"]'
         )
         count = candidates.count()
@@ -633,9 +635,19 @@ _CONTINUE_WITH_EMAIL_KEYWORDS: tuple[str, ...] = (
 )
 
 
-def _click_continue_with_email(page: Page) -> bool:
+def _is_continue_with_email(text: str) -> bool:
+    # Word-subset match (not a plain substring check), same reasoning as
+    # _is_submit_like/_click_submit: real copy inserts words into the target
+    # phrase ("Sign up with *your* email", seen live on dialpad.com), which
+    # breaks a contiguous substring match even though every target word is
+    # present.
+    words = _words(text)
+    return any(_words(keyword) <= words for keyword in _CONTINUE_WITH_EMAIL_KEYWORDS)
+
+
+def _click_continue_with_email(frame: Frame) -> bool:
     try:
-        candidates = page.locator(_CLICKABLE_SELECTOR)
+        candidates = frame.locator(_CLICKABLE_SELECTOR)
         count = candidates.count()
     except PlaywrightError:
         return False
@@ -647,8 +659,7 @@ def _click_continue_with_email(page: Page) -> bool:
                 continue
         except PlaywrightError:
             continue
-        lowered = _clickable_text(candidate).strip().lower()
-        if not any(keyword in lowered for keyword in _CONTINUE_WITH_EMAIL_KEYWORDS):
+        if not _is_continue_with_email(_clickable_text(candidate).strip()):
             continue
         try:
             candidate.click(timeout=3000)
@@ -891,6 +902,44 @@ def open_registration_entry_point(page: Page, run_logger: RunLogger) -> bool:
     return True
 
 
+# Many real signup forms render inside a third-party-embedded iframe rather
+# than the page's own document -- e.g. digifabster.com/getstarted/'s form is
+# a lazily-loaded HubSpot embed (`<div id="hubspotLazyForm">` that injects an
+# `<iframe>` only once its own script runs). `page.locator()` never looks
+# inside an iframe's content document, so every field-finding function above
+# is scoped to a single `Frame` and dispatched across `page.frames` (which
+# already includes the main frame) below, rather than being called on `page`
+# directly -- otherwise a form embedded this way is invisible to us: zero
+# fields found, nothing filled, and the loop either stalls or (worse) clicks
+# a real submit-like button before any required field has a value.
+#
+# The one exception is _click_unclaimed_choice_option, deliberately left
+# page-only (not dispatched here): its whole job is "click the first
+# plausible thing" as a last resort, which is safe for same-site
+# choice-wizard UI but too broad a net to risk running inside an arbitrary
+# third-party iframe (a video player embed, an ad, a chat widget) that
+# happens to share the page -- seen live on this same digifabster.com page,
+# which embeds an "Overview video" player alongside the HubSpot form.
+def _fill_across_frames(page: Page, fn: Callable[[Frame], int]) -> int:
+    total = 0
+    for frame in page.frames:
+        try:
+            total += fn(frame)
+        except PlaywrightError:
+            continue
+    return total
+
+
+def _click_across_frames(page: Page, fn: Callable[[Frame], bool]) -> bool:
+    for frame in page.frames:
+        try:
+            if fn(frame):
+                return True
+        except PlaywrightError:
+            continue
+    return False
+
+
 def run_registration(
     page: Page,
     store: EvidenceStore,
@@ -998,10 +1047,12 @@ def _run_registration(
             )
             break
 
-        filled = _fill_visible_fields(page, identity)
-        filled += _fill_unclaimed_empty_selects(page)
-        filled += _fill_unclaimed_generic_name_fields(page, identity)
-        checked_boxes = _check_consent_checkboxes(page)
+        filled = _fill_across_frames(page, lambda f: _fill_visible_fields(f, identity))
+        filled += _fill_across_frames(page, _fill_unclaimed_empty_selects)
+        filled += _fill_across_frames(
+            page, lambda f: _fill_unclaimed_generic_name_fields(f, identity)
+        )
+        checked_boxes = _fill_across_frames(page, _check_consent_checkboxes)
 
         picked = False
         clicked_email = False
@@ -1010,7 +1061,7 @@ def _run_registration(
             # _click_continue_with_email, tried first so it's always
             # preferred over an OAuth/SSO button) or a choice-wizard step
             # (see _click_unclaimed_choice_option) rather than a plain form.
-            clicked_email = _click_continue_with_email(page)
+            clicked_email = _click_across_frames(page, _click_continue_with_email)
             if not clicked_email:
                 picked = _click_unclaimed_choice_option(page)
 
@@ -1022,7 +1073,11 @@ def _run_registration(
         # fields are filled on the next iteration; that would submit an
         # empty form and trigger the exact validation errors this project
         # exists to avoid.
-        clicked = False if clicked_email else _click_submit(page, allow_reclaim=made_progress)
+        clicked = (
+            False
+            if clicked_email
+            else _click_across_frames(page, partial(_click_submit, allow_reclaim=made_progress))
+        )
 
         if not made_progress and not clicked:
             # The DOM-based heuristics above (fill/check/pick/submit) found

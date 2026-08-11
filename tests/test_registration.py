@@ -431,6 +431,48 @@ def test_prefers_continue_with_email_over_oauth_chooser_buttons(tmp_path: Path, 
     store.close()
 
 
+# Mirrors dialpad.com's real signup form: "Sign up with your email" has an
+# inserted word breaking a plain substring match against our "sign up with
+# email" keyword (same class of bug as _click_submit's "Start MY free
+# trial" precedent), plus OAuth buttons that must stay unclicked.
+_FORM_WITH_INSERTED_WORD_EMAIL_BUTTON = """
+<html><body>
+<div id="chooser">
+  <button onclick="document.title='oauth-clicked';">Continue with Google</button>
+  <button onclick="document.title='oauth-clicked';">Continue with Microsoft</button>
+  <button onclick="document.getElementById('form').style.display='block';">
+    Sign up with your email
+  </button>
+</div>
+<div id="form" style="display:none">
+  <input placeholder="Work Email" />
+  <input placeholder="First Name" />
+  <input placeholder="Last Name" />
+  <input type="password" placeholder="Create Password" />
+  <button onclick="document.title='submitted';">Continue</button>
+</div>
+</body></html>
+"""
+
+
+def test_clicks_continue_with_email_button_with_a_word_inserted_into_the_target_phrase(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_FORM_WITH_INSERTED_WORD_EMAIL_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(
+        page, store, run_logger, first_name_override="Levent", last_name_override="Aksan"
+    )
+
+    assert page.locator('#form input[placeholder="Work Email"]').input_value() == (
+        result.identity.email
+    )
+    assert result.submitted is True
+    assert page.title() == "submitted"
+    store.close()
+
+
 def test_fills_country_select_dropdown_via_exact_label_match(tmp_path: Path, page: Page) -> None:
     page.set_content(_FORM_WITH_COUNTRY_DROPDOWN)
     store, run_logger = _store_and_logger(tmp_path)
