@@ -74,12 +74,21 @@ def _execute(job: JobState, *, headless: bool, attempt_registration: bool) -> No
 
 
 def _screenshots_for_run(config: Config, run_id: str) -> list[dict[str, Any]]:
+    # Matches on visible_ui.screenshot_kind (set by every capture_and_record
+    # call, see screenshot.py), not the label text -- registration.py's own
+    # captures ("registration form", "registration form after N step(s)",
+    # "registration blocked by anti-bot challenge (captcha)") never started
+    # with "screenshot:" and were previously invisible in this dashboard
+    # entirely, exploration-phase page screenshots being the only ones that
+    # ever showed up.
     shots: list[dict[str, Any]] = []
     with EvidenceStore.from_config(config) as store:
         for e in store.for_run(run_id):
-            if not e.label.startswith("screenshot:") or not e.screenshot:
+            if not e.screenshot:
                 continue
             kind = e.visible_ui.get("screenshot_kind") if isinstance(e.visible_ui, dict) else None
+            if kind is None:
+                continue
             shots.append(
                 {
                     "url": "/" + e.screenshot.replace("\\", "/"),

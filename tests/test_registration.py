@@ -346,6 +346,43 @@ def test_fills_industry_specific_name_and_website_fields_with_no_errors(
     store.close()
 
 
+# Mirrors conceptboard.com's real signup form: a bare "Name" field labeled
+# just "Name" with an example-value placeholder ("Jane Doe") that must NOT
+# be read as an organization qualifier, plus separate Password/Confirm
+# password fields -- leaving Confirm password empty triggers the site's own
+# "Passwords do not match" validation error.
+_FORM_WITH_BARE_NAME_LABEL_AND_CONFIRM_PASSWORD = """
+<html><body>
+<label for="name">Name</label>
+<input id="name" name="name" type="text" placeholder="Jane Doe" />
+<label for="email">Email</label>
+<input id="email" name="email" type="email" placeholder="jane.doe@company.com" />
+<label for="password">Password</label>
+<input id="password" name="Password" type="password" />
+<label for="confirm">Confirm password</label>
+<input id="confirm" name="Confirm password" type="password" />
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+
+def test_fills_bare_name_label_and_confirm_password_field(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_WITH_BARE_NAME_LABEL_AND_CONFIRM_PASSWORD)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    identity = result.identity
+    # A label of just "Name" plus an example-value placeholder ("Jane Doe")
+    # is the person's name, not identity.company_name -- the placeholder
+    # must not be misread as an organization qualifier like "Church".
+    assert page.locator("#name").input_value() == identity.full_name
+    assert page.locator("#password").input_value() == identity.password
+    assert page.locator("#confirm").input_value() == identity.password
+    assert result.submitted is True
+    store.close()
+
+
 # Mirrors Synder's real signup form (reached from cloudbusinesshq.com): an
 # auth-method chooser with OAuth/SSO/integration buttons plus one "Continue
 # with Email" option. Clicking it reveals -- on the *same* page, no
@@ -849,4 +886,42 @@ def test_vision_fallback_stops_registration_when_it_cannot_help(
     assert call_count == 1
     assert result.steps_completed == 0
     assert page.title() != "submitted"
+    store.close()
+
+
+# --- CAPTCHA/anti-bot challenge stops registration cleanly (GRO-42) ---------
+
+# A CAPTCHA iframe's own controls are unreachable (cross-origin, and we don't
+# solve them anyway), but a leftover OAuth-style button sitting right next to
+# it stays in the DOM and "visible" per Playwright even though a human
+# couldn't really click it under the overlay -- mirrors what happened live on
+# Synder's signup (reached from cloudbusinesshq.com): a reCAPTCHA challenge
+# appeared after "Sign up", and the choice-wizard fallback went on to click
+# "Continue with Xero" instead of stopping.
+_PAGE_WITH_CAPTCHA_AND_LEFTOVER_OAUTH_BUTTON = """
+<html><body>
+<button onclick="document.title='oauth-clicked';">Continue with Xero</button>
+<iframe src="data:text/html,recaptcha-challenge-fixture" width="300" height="400"></iframe>
+</body></html>
+"""
+
+
+def test_stops_registration_when_captcha_challenge_appears(tmp_path: Path, page: Page) -> None:
+    page.set_content(_PAGE_WITH_CAPTCHA_AND_LEFTOVER_OAUTH_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, max_steps=5)
+
+    assert result.steps_completed == 0
+    assert result.submitted is False
+    # Never fell through to the choice-wizard fallback and clicked the
+    # leftover button underneath the overlay.
+    assert page.title() != "oauth-clicked"
+
+    evidence = store.for_run(run_logger.run_id)
+    captcha_shots = [
+        e for e in evidence if e.label == "registration blocked by anti-bot challenge (captcha)"
+    ]
+    assert len(captcha_shots) == 1
+    assert captcha_shots[0].screenshot is not None
     store.close()

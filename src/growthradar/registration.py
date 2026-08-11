@@ -53,8 +53,28 @@ _CLAIMED_MARKER = "data-growthradar-filled"
 # "name" with identity.company_name -- including a genuinely bare "Name"
 # field with no "full"/"your" qualifier, an accepted tradeoff since that
 # phrasing is rare and the field still gets a plausible, non-empty value.
+# confirm_password must precede password: password's input_type="password"
+# shortcut in _find_field grabs the first unclaimed type=password field
+# regardless of keyword, so without this ordering it would claim whichever
+# password field comes first in the DOM -- possibly "Confirm password"
+# itself -- before confirm_password's own label-text match ever gets a
+# chance, leaving the *other* password field unfilled (seen live on
+# conceptboard.com: "Confirm password" was left empty, and the site's own
+# "Passwords do not match" validation blocked submission).
 _FIELD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("email", ("email",)),
+    (
+        "confirm_password",
+        (
+            "confirm password",
+            "confirm your password",
+            "repeat password",
+            "verify password",
+            "re-enter password",
+            "re enter password",
+            "password confirmation",
+        ),
+    ),
     ("password", ("password", "pwd")),
     ("first_name", ("first name", "firstname", "first-name", "given name")),
     ("last_name", ("last name", "lastname", "last-name", "surname", "family name")),
@@ -220,6 +240,9 @@ def _fill_visible_fields(page: Page, identity: Identity) -> int:
     values = {
         "email": identity.email,
         "password": identity.password,
+        # Same value as "password" -- a confirm/repeat field must match the
+        # original for the site's own validation to accept it.
+        "confirm_password": identity.password,
         "first_name": identity.first_name,
         "last_name": identity.last_name,
         "company_name": identity.company_name,
@@ -304,6 +327,28 @@ def _input_hint_text(locator: Locator) -> str:
         return ""
 
 
+def _qualifier_hint_text(locator: Locator) -> str:
+    """Same signal as _input_hint_text but excludes the placeholder --
+    used only for the bare-vs-qualified decision in _is_bare_name_hint, not
+    the initial "is this a name field at all" gate (which still needs
+    placeholder, since some fields -- e.g. Synder's bare "Name" input -- have
+    no other signal at all). A placeholder is example VALUE text ("Jane
+    Doe", "jane.doe@company.com"), not a qualifier describing what the field
+    IS; folding it into the qualifier check read Conceptboard's real "Name"
+    field (label "Name", placeholder "Jane Doe") as organization-qualified
+    and filled it with the company name instead of the person's.
+    """
+    try:
+        return str(
+            locator.evaluate(
+                "el => [el.name, el.id, el.getAttribute('aria-label'), "
+                "(el.labels && el.labels[0] && el.labels[0].innerText) || ''].join(' ')"
+            )
+        )
+    except PlaywrightError:
+        return ""
+
+
 _NAME_WORD_RE = re.compile(r"\bname\b")
 _NAME_QUALIFIER_STRIP_RE = re.compile(r"\b(name|your|full)\b")
 _ALPHA_WORD_RE = re.compile(r"[a-z]{3,}")
@@ -317,7 +362,8 @@ def _is_bare_name_hint(hint: str) -> bool:
     leaves nothing. Ambiguous fields default to a person's name (not a
     company one) -- seen live on Synder's post-"Continue with Email" form
     (cloudbusinesshq.com): a single "Name" input beside Email/Password, no
-    company field anywhere on screen at all.
+    company field anywhere on screen at all. `hint` should come from
+    _qualifier_hint_text, not _input_hint_text -- see there for why.
     """
     residual = _NAME_QUALIFIER_STRIP_RE.sub("", hint)
     return not _ALPHA_WORD_RE.search(residual)
@@ -357,7 +403,8 @@ def _fill_unclaimed_generic_name_fields(page: Page, identity: Identity) -> int:
         hint = _input_hint_text(candidate).lower()
         if not _NAME_WORD_RE.search(hint):
             continue
-        value = identity.full_name if _is_bare_name_hint(hint) else identity.company_name
+        qualifier_hint = _qualifier_hint_text(candidate).lower()
+        value = identity.full_name if _is_bare_name_hint(qualifier_hint) else identity.company_name
         if not _set_field_value(candidate, value):
             continue
         _claim(candidate)
@@ -643,6 +690,60 @@ def _click_unclaimed_choice_option(page: Page) -> bool:
     return False
 
 
+# A CAPTCHA/anti-bot challenge widget (Google reCAPTCHA, hCaptcha, Cloudflare
+# Turnstile) renders in an iframe we neither can nor try to interact with --
+# see registration_blocked_by_captcha below. Its own controls are invisible
+# to a plain page.locator() (Playwright doesn't reach into cross-origin
+# iframes), but the underlying page's own buttons behind/around the overlay
+# -- including OAuth/integration buttons _is_oauth_button would otherwise
+# exclude -- stay in the DOM and register as "visible" even though a human
+# couldn't actually click most of them. Without this check, the choice-
+# wizard/vision fallback below can find and click one of those instead (seen
+# live on Synder's signup, reached from cloudbusinesshq.com: a reCAPTCHA
+# image challenge appeared after "Sign up", and the fallback went on to
+# click "Continue with Xero", wandering off to Xero's own site for the rest
+# of the run's step budget).
+_CAPTCHA_SELECTOR = (
+    'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
+    'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
+)
+# reCAPTCHA (and, empirically, most other providers) renders two distinct
+# things matching the selector above: a small, always-present "protected by
+# reCAPTCHA" anchor/checkbox badge (~256x60px, harmless, present on nearly
+# every reCAPTCHA-using page whether or not a human will ever see a real
+# challenge) and, only once actually triggered, a much larger challenge
+# surface (~400x580px on Synder's image-grid puzzle). Without a size floor,
+# the badge alone -- present the instant "Continue with Email" reveals
+# Synder's form, long before Sign up is even clicked -- would trip this
+# check on essentially every reCAPTCHA-protected signup form, most of which
+# never show a real challenge at all. 100px comfortably separates a checkbox
+# from an actual puzzle across the providers observed live so far.
+_MIN_CAPTCHA_CHALLENGE_PX = 100
+
+
+def _captcha_challenge_visible(page: Page) -> bool:
+    try:
+        widgets = page.locator(_CAPTCHA_SELECTOR)
+        count = widgets.count()
+    except PlaywrightError:
+        return False
+    for i in range(count):
+        widget = widgets.nth(i)
+        try:
+            if not widget.is_visible():
+                continue
+            box = widget.bounding_box()
+        except PlaywrightError:
+            continue
+        if (
+            box is not None
+            and box["width"] >= _MIN_CAPTCHA_CHALLENGE_PX
+            and box["height"] >= _MIN_CAPTCHA_CHALLENGE_PX
+        ):
+            return True
+    return False
+
+
 def _click_by_exact_text(page: Page, text: str) -> bool:
     """Click the visible, unclaimed clickable element whose text exactly
     matches `text` -- used only for a vision-fallback suggestion (see
@@ -879,6 +980,24 @@ def _run_registration(
     vision_attempts = 0
     for _ in range(max_steps):
         dismiss_overlays(page)
+
+        if _captcha_challenge_visible(page):
+            # Nothing safe left to do: we don't solve CAPTCHAs, and letting
+            # the loop continue risks the choice-wizard/vision fallback
+            # clicking whatever's left underneath the overlay instead (see
+            # _captcha_challenge_visible). Capture this exact moment --
+            # useful evidence in its own right (the target blocks automated
+            # signup here) -- and stop.
+            run_logger.action("registration_blocked_by_captcha", url=page.url)
+            capture_and_record(
+                page,
+                store,
+                run_logger.run_id,
+                ScreenshotKind.REGISTRATION,
+                "registration blocked by anti-bot challenge (captcha)",
+            )
+            break
+
         filled = _fill_visible_fields(page, identity)
         filled += _fill_unclaimed_empty_selects(page)
         filled += _fill_unclaimed_generic_name_fields(page, identity)
