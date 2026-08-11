@@ -21,8 +21,10 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 # Embedded HTML/CSS/JS dashboard template -- wrapping these lines would hurt
-# readability of the actual web content for no benefit.
-"src/growthradar/web.py" = ["E501"]
+# readability of the actual web content for no benefit. B008 is FastAPI's
+# required idiom for declaring an upload parameter (File(...) as a default,
+# evaluated once at import time by the framework, not per-request).
+"src/growthradar/web.py" = ["E501", "B008"]
 
 [tool.black]
 line-length = 100

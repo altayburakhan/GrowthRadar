@@ -12,6 +12,8 @@ so the dashboard never duplicates data collection.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import threading
 import uuid
@@ -20,8 +22,9 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -72,6 +75,82 @@ def _execute(job: JobState, *, headless: bool, attempt_registration: bool) -> No
         with _jobs_lock:
             job.error = str(exc)
             job.status = "error"
+
+
+@dataclass
+class BatchRow:
+    input: str
+    url: str | None
+    status: str  # "queued" | "invalid" | "running" | "done" | "error"
+    run_id: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class BatchState:
+    batch_id: str
+    rows: list[BatchRow]
+    status: str  # "running" | "done"
+
+
+_batches: dict[str, BatchState] = {}
+_batches_lock = threading.Lock()
+
+
+def _parse_batch_csv(content: str) -> list[BatchRow]:
+    """One target URL per row, first column.
+
+    Blank lines are skipped silently -- trailing blank lines are routine in
+    exported/hand-edited CSVs, not a user error worth flagging. A bare word
+    like "url" or "example" is queued as-is (https:// prefixed, same as the
+    single-URL dashboard input) rather than guessed at as a stray header --
+    there's no reliable way to tell a header cell apart from a genuine
+    one-word intranet hostname without a network call, and a bad guess just
+    fails gracefully as a normal run error like any other unreachable
+    target. Only rows with no possible host at all (e.g. a bare scheme with
+    nothing after it) or an explicitly non-http(s) scheme (e.g. "ftp://",
+    "mailto:") are flagged "invalid" up front, so the uploader sees exactly
+    which rows never ran instead of a silently-dropped row looking like it
+    ran and scored nothing (Linear.md: "never make unsupported claims").
+    """
+    rows: list[BatchRow] = []
+    for raw_row in csv.reader(io.StringIO(content)):
+        if not raw_row or not raw_row[0].strip():
+            continue
+        raw = raw_row[0].strip()
+        candidate = raw if "://" in raw else f"https://{raw}"
+        parsed = urlparse(candidate)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            rows.append(BatchRow(input=raw, url=None, status="invalid", error="Gecersiz URL"))
+            continue
+        rows.append(BatchRow(input=raw, url=candidate, status="queued"))
+    return rows
+
+
+def _run_batch(batch: BatchState) -> None:
+    # Deliberately sequential, one Playwright session at a time -- matches
+    # every other phase's per-run isolation and avoids several real browser
+    # sessions competing for the same machine's resources at once.
+    config = Config.from_env()
+    for row in batch.rows:
+        if row.status == "invalid":
+            continue
+        row.status = "running"
+        row.run_id = f"web-{uuid.uuid4().hex[:8]}"
+        assert row.url is not None
+        job = JobState(
+            run_id=row.run_id,
+            url=row.url,
+            status="running",
+            started_at=datetime.now(UTC).isoformat(),
+            config=config,
+        )
+        with _jobs_lock:
+            _jobs[row.run_id] = job
+        _execute(job, headless=True, attempt_registration=True)
+        row.status = job.status
+        row.error = job.error
+    batch.status = "done"
 
 
 def _screenshots_for_run(config: Config, run_id: str) -> list[dict[str, Any]]:
@@ -201,6 +280,32 @@ def create_app() -> FastAPI:
             payload["error"] = job.error
         return payload
 
+    @app.post("/api/batch")
+    async def start_batch(file: UploadFile = File(...)) -> dict[str, Any]:
+        raw = await file.read()
+        rows = _parse_batch_csv(raw.decode("utf-8", errors="replace"))
+        if not rows:
+            raise HTTPException(status_code=400, detail="CSV bos ya da okunamadi")
+
+        batch_id = f"batch-{uuid.uuid4().hex[:8]}"
+        batch = BatchState(batch_id=batch_id, rows=rows, status="running")
+        with _batches_lock:
+            _batches[batch_id] = batch
+        _executor.submit(_run_batch, batch)
+        return {"batch_id": batch_id, "status": "running", "row_count": len(rows)}
+
+    @app.get("/api/batch/{batch_id}")
+    def get_batch(batch_id: str) -> dict[str, Any]:
+        with _batches_lock:
+            batch = _batches.get(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        return {
+            "batch_id": batch.batch_id,
+            "status": batch.status,
+            "rows": [asdict(r) for r in batch.rows],
+        }
+
     @app.get("/api/history")
     def history(limit: int = 20) -> list[dict[str, Any]]:
         config = Config.from_env()
@@ -298,6 +403,18 @@ _INDEX_HTML = """<!doctype html>
   .history-item:hover { background: var(--bg); }
   .history-item .company { font-weight: 600; }
   .history-item .url { color: var(--muted); }
+  .batch-row {
+    display: flex; justify-content: space-between; gap: 10px; padding: 6px 0;
+    border-bottom: 1px solid var(--border); font-size: 13px;
+  }
+  .batch-row:last-child { border-bottom: none; }
+  .batch-row.clickable { cursor: pointer; }
+  .batch-row.clickable:hover { background: var(--bg); }
+  .batch-row .url { color: var(--muted); }
+  .batch-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; color: var(--muted); }
+  .batch-status.done { color: var(--cold); }
+  .batch-status.error, .batch-status.invalid { color: var(--hot); }
+  .batch-status.running { color: var(--warm); }
   .empty { color: var(--muted); font-size: 13px; }
 </style>
 </head>
@@ -321,6 +438,16 @@ _INDEX_HTML = """<!doctype html>
     <div id="statusLine" class="status-line"></div>
   </div>
 
+  <div class="panel">
+    <h2 style="margin-top:0; font-size:15px;">Toplu tarama (CSV)</h2>
+    <div class="row">
+      <input id="csvFile" type="file" accept=".csv,text/csv" />
+      <button id="batchBtn">CSV Yukle</button>
+    </div>
+    <div id="batchStatusLine" class="status-line"></div>
+    <div id="batchList"></div>
+  </div>
+
   <div id="reportPanel"></div>
 
   <div class="panel">
@@ -334,7 +461,16 @@ const startBtn = document.getElementById('startBtn');
 const statusLine = document.getElementById('statusLine');
 const reportPanel = document.getElementById('reportPanel');
 const historyList = document.getElementById('historyList');
+const batchBtn = document.getElementById('batchBtn');
+const batchStatusLine = document.getElementById('batchStatusLine');
+const batchList = document.getElementById('batchList');
 let pollTimer = null;
+let batchPollTimer = null;
+
+const _BATCH_STATUS_LABELS = {
+  queued: 'sirada', running: 'calisiyor', done: 'tamamlandi',
+  error: 'hata', invalid: 'gecersiz url',
+};
 
 function verdictBadge(verdict) {
   return `<span class="badge ${verdict}">${verdict}</span>`;
@@ -489,6 +625,63 @@ async function viewRun(runId) {
   renderReport(data);
 }
 
+function renderBatchRows(rows) {
+  batchList.innerHTML = rows.map(r => {
+    const clickable = r.status === 'done' || r.status === 'error';
+    const label = _BATCH_STATUS_LABELS[r.status] || r.status;
+    return `
+    <div class="batch-row ${clickable ? 'clickable' : ''}" data-run-id="${r.run_id || ''}">
+      <span class="url">${r.input}</span>
+      <span class="batch-status ${r.status}">${r.error ? `${label}: ${r.error}` : label}</span>
+    </div>`;
+  }).join('');
+  batchList.querySelectorAll('.batch-row.clickable').forEach(el => {
+    if (el.dataset.runId) {
+      el.addEventListener('click', () => viewRun(el.dataset.runId));
+    }
+  });
+}
+
+async function pollBatch(batchId) {
+  const res = await fetch(`/api/batch/${batchId}`);
+  const data = await res.json();
+  renderBatchRows(data.rows);
+
+  if (data.status === 'running') {
+    const done = data.rows.filter(r => r.status === 'done' || r.status === 'error' || r.status === 'invalid').length;
+    batchStatusLine.innerHTML = `<span class="spinner"></span>Isleniyor (${done}/${data.rows.length})...`;
+    return;
+  }
+  clearInterval(batchPollTimer);
+  batchBtn.disabled = false;
+  batchStatusLine.innerHTML = 'Toplu tarama tamamlandi.';
+  loadHistory();
+}
+
+async function startBatch() {
+  const fileInput = document.getElementById('csvFile');
+  const file = fileInput.files[0];
+  if (!file) { return; }
+
+  batchBtn.disabled = true;
+  batchList.innerHTML = '';
+  batchStatusLine.classList.add('active');
+  batchStatusLine.innerHTML = `<span class="spinner"></span>Yukleniyor...`;
+
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch('/api/batch', { method: 'POST', body: formData });
+  if (!res.ok) {
+    batchBtn.disabled = false;
+    const detail = (await res.json().catch(() => ({}))).detail;
+    batchStatusLine.innerHTML = detail || 'Yuklenemedi.';
+    return;
+  }
+  const data = await res.json();
+  batchPollTimer = setInterval(() => pollBatch(data.batch_id), 2000);
+  pollBatch(data.batch_id);
+}
+
 async function loadHistory() {
   const res = await fetch('/api/history');
   const rows = await res.json();
@@ -508,6 +701,7 @@ async function loadHistory() {
 
 startBtn.addEventListener('click', startRun);
 document.getElementById('url').addEventListener('keydown', e => { if (e.key === 'Enter') startRun(); });
+batchBtn.addEventListener('click', startBatch);
 loadHistory();
 </script>
 </body>

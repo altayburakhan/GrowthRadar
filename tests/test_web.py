@@ -3,7 +3,7 @@ from pathlib import Path
 
 from growthradar.config import Config
 from growthradar.evidence import EvidenceStore
-from growthradar.web import _run_from_evidence, _screenshots_for_run
+from growthradar.web import _parse_batch_csv, _run_from_evidence, _screenshots_for_run
 
 
 def _config(tmp_path: Path) -> Config:
@@ -86,3 +86,25 @@ def test_run_from_evidence_returns_none_when_no_evidence_exists(tmp_path: Path) 
         pass  # ensure the db file exists, but write nothing for this run_id
 
     assert _run_from_evidence(config, "missing-run") is None
+
+
+def test_parse_batch_csv_normalizes_urls_and_skips_blank_lines() -> None:
+    content = "example.com\n\nhttps://other.com/signup\n   \n"
+
+    rows = _parse_batch_csv(content)
+
+    assert [r.input for r in rows] == ["example.com", "https://other.com/signup"]
+    assert [r.url for r in rows] == ["https://example.com", "https://other.com/signup"]
+    assert all(r.status == "queued" for r in rows)
+
+
+def test_parse_batch_csv_flags_a_row_with_no_usable_host_as_invalid() -> None:
+    content = "ftp://bad-scheme.com\nhttps://good.com\n"
+
+    rows = _parse_batch_csv(content)
+
+    assert rows[0].input == "ftp://bad-scheme.com"
+    assert rows[0].status == "invalid"
+    assert rows[0].url is None
+    assert rows[0].error is not None
+    assert rows[1].status == "queued"
