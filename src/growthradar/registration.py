@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # (seen on ansarada.com's signup wizard).
 MAX_FORM_STEPS = 8
 _MAX_VISION_ATTEMPTS = 2
+# See the "nothing found anywhere yet" branch in _run_registration's loop --
+# a lazily-loaded embedded form (e.g. HubSpot) can take several seconds
+# after the page otherwise looks settled to actually inject its fields.
+_MAX_EMPTY_RETRIES = 2
+_EMPTY_RETRY_WAIT_MS = 2000
 _CLAIMED_MARKER = "data-growthradar-filled"
 
 # Ordered most-specific first so a broad pattern (e.g. "first name") is tried
@@ -1027,6 +1032,7 @@ def _run_registration(
     steps_completed = 0
     submitted = False
     vision_attempts = 0
+    empty_retries = 0
     for _ in range(max_steps):
         dismiss_overlays(page)
 
@@ -1080,6 +1086,18 @@ def _run_registration(
         )
 
         if not made_progress and not clicked:
+            # Nothing found anywhere yet -- could be genuinely stuck, or
+            # could be a lazily-loaded embedded form still initializing
+            # (seen live on digifabster.com/getstarted/: a HubSpot form
+            # injects its <iframe> and fields several seconds after the page
+            # otherwise looks settled). A couple of short, cheap retries
+            # before falling to the vision fallback below covers this
+            # without meaningfully slowing down the genuinely-stuck case.
+            if empty_retries < _MAX_EMPTY_RETRIES:
+                empty_retries += 1
+                page.wait_for_timeout(_EMPTY_RETRY_WAIT_MS)
+                continue
+
             # The DOM-based heuristics above (fill/check/pick/submit) found
             # nothing at all -- genuinely stuck. Screenshot the page and ask
             # a vision-capable LLM to point at one of the same clickable

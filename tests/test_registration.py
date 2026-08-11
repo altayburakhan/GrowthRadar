@@ -1,3 +1,4 @@
+import html
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -966,4 +967,71 @@ def test_stops_registration_when_captcha_challenge_appears(tmp_path: Path, page:
     ]
     assert len(captcha_shots) == 1
     assert captcha_shots[0].screenshot is not None
+    store.close()
+
+
+# --- Iframe-embedded forms and lazily-loaded widgets (GRO-45) ---------------
+
+# Mirrors digifabster.com/getstarted/: the real signup form renders inside a
+# third-party-embedded iframe (a HubSpot form there), invisible to a plain
+# page.locator() call, which only ever searches the main document.
+_IFRAME_INNER_FORM_HTML = (
+    "<html><body>"
+    '<input placeholder="First Name" />'
+    '<input placeholder="Last Name" />'
+    '<input type="email" placeholder="Email" />'
+    "<button onclick=\"document.title='submitted'\">Sign up</button>"
+    "</body></html>"
+)
+_PAGE_WITH_FORM_INSIDE_IFRAME = (
+    f'<html><body><iframe srcdoc="{html.escape(_IFRAME_INNER_FORM_HTML)}"></iframe></body></html>'
+)
+
+
+def test_fills_form_embedded_inside_an_iframe(tmp_path: Path, page: Page) -> None:
+    page.set_content(_PAGE_WITH_FORM_INSIDE_IFRAME)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(
+        page, store, run_logger, first_name_override="Levent", last_name_override="Aksan"
+    )
+
+    frame = page.frame_locator("iframe")
+    assert frame.locator('input[placeholder="First Name"]').input_value() == "Levent"
+    assert frame.locator('input[placeholder="Last Name"]').input_value() == "Aksan"
+    assert frame.locator('input[placeholder="Email"]').input_value() == result.identity.email
+    assert result.submitted is True
+    # The onclick handler sets *the iframe's own* document.title, not the
+    # outer page's -- confirm the click actually landed there.
+    iframe_frame = next(f for f in page.frames if f != page.main_frame)
+    assert iframe_frame.title() == "submitted"
+    store.close()
+
+
+# Mirrors digifabster.com's lazily-loaded HubSpot embed: nothing is present
+# at all when the page first settles, and the real form only appears a few
+# seconds later once the widget's own script finishes initializing.
+_PAGE_WITH_DELAYED_LAZY_FORM = """
+<html><body>
+<div id="lazy"></div>
+<script>
+setTimeout(() => {
+  document.getElementById('lazy').innerHTML =
+    '<input placeholder="Email" type="email" />' +
+    '<input placeholder="Password" type="password" />' +
+    '<button onclick="document.title=\\'submitted\\'">Sign up</button>';
+}, 2500);
+</script>
+</body></html>
+"""
+
+
+def test_retries_before_giving_up_on_a_lazily_loaded_form(tmp_path: Path, page: Page) -> None:
+    page.set_content(_PAGE_WITH_DELAYED_LAZY_FORM)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, max_steps=5)
+
+    assert result.submitted is True
+    assert page.title() == "submitted"
     store.close()

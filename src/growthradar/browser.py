@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from playwright.sync_api import Dialog, Page, Playwright, Request, sync_playwright
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.stealth import stealth_sync
 
 from growthradar.config import Config
 
@@ -139,6 +140,7 @@ class BrowserSession:
         context.on("page", self._handle_new_page)
 
         page = context.new_page()
+        stealth_sync(page)
         page.on("dialog", self._handle_dialog)
         page.on("request", self._handle_request)
         self.page = page
