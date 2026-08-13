@@ -144,12 +144,30 @@ class BrowserSession:
             return self.page
 
         self._playwright = sync_playwright().start()
-        browser = self._playwright.chromium.launch(headless=self.headless)
-        context = browser.new_context(user_agent=self.config.user_agent)
+        if self.config.google_profile_dir:
+            # A persistent, already-authenticated profile so "Continue with
+            # Google" buttons can go through instead of being skipped (see
+            # registration.py's _is_oauth_button) -- the profile must already
+            # be signed in (see scripts/google_profile_bootstrap.py); this
+            # never attempts to log in itself. `channel="chrome"` uses the
+            # real installed Google Chrome rather than Playwright's bundled
+            # Chromium, matching the actual browser the profile's Google
+            # session was created in.
+            context = self._playwright.chromium.launch_persistent_context(
+                self.config.google_profile_dir,
+                channel="chrome",
+                headless=self.headless,
+                user_agent=self.config.user_agent,
+            )
+        else:
+            browser = self._playwright.chromium.launch(headless=self.headless)
+            context = browser.new_context(user_agent=self.config.user_agent)
         context.set_default_timeout(self.config.request_timeout * 1000)
         context.on("page", self._handle_new_page)
 
-        page = context.new_page()
+        # A persistent context opens with one blank page already; a fresh
+        # context has none yet.
+        page = context.pages[0] if context.pages else context.new_page()
         stealth_sync(page)
         page.on("dialog", self._handle_dialog)
         page.on("request", self._handle_request)
@@ -176,10 +194,15 @@ class BrowserSession:
         self.extra_pages.clear()
 
         if self.page is not None:
+            # A persistent context (google_profile_dir) has no separate
+            # `.browser` -- closing the context alone shuts the whole thing
+            # down, and `.browser` is None rather than a Browser to close.
+            browser = self.page.context.browser
             with suppress(PlaywrightError):
                 self.page.context.close()
-            with suppress(PlaywrightError):
-                self.page.context.browser.close()  # type: ignore[union-attr]
+            if browser is not None:
+                with suppress(PlaywrightError):
+                    browser.close()
         if self._playwright is not None:
             with suppress(PlaywrightError):
                 self._playwright.stop()

@@ -533,9 +533,16 @@ def _words(text: str) -> set[str]:
 _OAUTH_PHRASE_RE = re.compile(r"\b(with|via)\b")
 
 
-def _is_oauth_button(locator: Locator) -> bool:
+def _is_oauth_button(locator: Locator, *, allow_google: bool = False) -> bool:
     lowered = _clickable_text(locator).lower()
-    if any(keyword in lowered for keyword in _OAUTH_BUTTON_KEYWORDS):
+    matched_providers = [keyword for keyword in _OAUTH_BUTTON_KEYWORDS if keyword in lowered]
+    if matched_providers:
+        # Google-only opt-in (config.allow_google_oauth + a signed-in
+        # google_profile_dir, see browser.py): a button naming Google *and*
+        # some other provider ("Google Workspace SSO") still isn't one we
+        # can complete, so only an exact single-provider match is exempted.
+        if allow_google and matched_providers == ["google"]:
+            return False
         return True
     # "Sign in/up/continue with/via <provider>" for a provider this project
     # doesn't (and can't exhaustively) enumerate in _OAUTH_BUTTON_KEYWORDS --
@@ -555,7 +562,9 @@ _LOGIN_KEYWORDS: tuple[str, ...] = ("log in", "login", "sign in")
 _CLICKABLE_SELECTOR = 'button, a, [role="button"]'
 
 
-def _click_submit(frame: Frame, *, allow_reclaim: bool = False) -> bool:
+def _click_submit(
+    frame: Frame, *, allow_reclaim: bool = False, allow_google_oauth: bool = False
+) -> bool:
     # A CSS selector, not get_by_role(name=..., exact=False): Playwright's
     # substring matching there requires our target phrase to appear as an
     # unbroken run of words in the element's accessible name, which fails on
@@ -584,7 +593,7 @@ def _click_submit(frame: Frame, *, allow_reclaim: bool = False) -> bool:
                 continue
             if not target_words <= _words(_clickable_text(candidate)):
                 continue
-            if _is_oauth_button(candidate):
+            if _is_oauth_button(candidate, allow_google=allow_google_oauth):
                 continue
             try:
                 candidate.click(timeout=3000)
@@ -695,7 +704,7 @@ def _click_continue_with_email(frame: Frame) -> bool:
     return False
 
 
-def _click_unclaimed_choice_option(page: Page) -> bool:
+def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = False) -> bool:
     try:
         candidates = page.locator(_CHOICE_CLICKABLE_SELECTOR)
         count = candidates.count()
@@ -713,7 +722,7 @@ def _click_unclaimed_choice_option(page: Page) -> bool:
         if not text:
             continue
         lowered = text.lower()
-        if _is_oauth_button(candidate) or _is_submit_like(lowered):
+        if _is_oauth_button(candidate, allow_google=allow_google_oauth) or _is_submit_like(lowered):
             continue
         if any(keyword in lowered for keyword in _CHOICE_EXCLUDE_KEYWORDS):
             continue
@@ -1064,6 +1073,8 @@ def _run_registration(
     max_steps: int,
     config: Config | None,
 ) -> RegistrationResult:
+    allow_google_oauth = bool(config and config.allow_google_oauth)
+
     inbox: TempInbox | None = None
     if temp_email_provider is not None:
         inbox = temp_email_provider.create_inbox()
@@ -1119,7 +1130,7 @@ def _run_registration(
             # (see _click_unclaimed_choice_option) rather than a plain form.
             clicked_email = _click_across_frames(page, _click_continue_with_email)
             if not clicked_email:
-                picked = _click_unclaimed_choice_option(page)
+                picked = _click_unclaimed_choice_option(page, allow_google_oauth=allow_google_oauth)
 
         made_progress = filled > 0 or checked_boxes > 0 or picked or clicked_email
         # Clicking "Continue with Email" only reveals the real form (see
@@ -1132,7 +1143,14 @@ def _run_registration(
         clicked = (
             False
             if clicked_email
-            else _click_across_frames(page, partial(_click_submit, allow_reclaim=made_progress))
+            else _click_across_frames(
+                page,
+                partial(
+                    _click_submit,
+                    allow_reclaim=made_progress,
+                    allow_google_oauth=allow_google_oauth,
+                ),
+            )
         )
 
         if not made_progress and not clicked:

@@ -78,6 +78,34 @@ _FORM_WITH_COUNTRY_DROPDOWN = """
 </body></html>
 """
 
+_FORM_WITH_FACEBOOK_OAUTH_BUTTON = """
+<html><body>
+<input name="email" type="email" placeholder="Email" />
+<input name="password" type="password" placeholder="Password" />
+<button onclick="document.title='oauth-clicked';">Continue with Facebook</button>
+<button onclick="document.title='submitted';">Continue</button>
+</body></html>
+"""
+
+# Unlike _FORM_WITH_OAUTH_BUTTON (whose Google click is a same-page no-op by
+# design, so the loop is expected to move on to the real "Continue" button
+# instead), this one's Google button clears the form -- standing in for a
+# real OAuth redirect actually navigating away -- so a successful Google
+# click is the run's one and only step, with nothing left behind for a later
+# iteration to find and click.
+_FORM_WITH_GOOGLE_OAUTH_BUTTON_THAT_NAVIGATES_AWAY = """
+<html><body>
+<div id="form">
+<input name="email" type="email" placeholder="Email" />
+<input name="password" type="password" placeholder="Password" />
+<button onclick="document.title='oauth-clicked'; document.getElementById('form').remove();">
+  Continue with Google
+</button>
+<button onclick="document.title='submitted';">Continue</button>
+</div>
+</body></html>
+"""
+
 _FORM_WITH_INSERTED_WORD_BUTTON = """
 <html><body>
 <input name="email" type="email" placeholder="Email" />
@@ -233,6 +261,42 @@ def test_skips_oauth_button_and_clicks_the_real_submit_button(tmp_path: Path, pa
     store, run_logger = _store_and_logger(tmp_path)
 
     result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    assert page.title() == "submitted"
+    store.close()
+
+
+def test_clicks_google_oauth_button_when_google_profile_is_configured(
+    tmp_path: Path, page: Page, config: Config
+) -> None:
+    # With a signed-in google_profile_dir (browser.py) and explicit opt-in,
+    # "Continue with Google" is no longer a dead end to route around -- it's
+    # now the preferred path, since the whole point of the persistent profile
+    # is to complete it instead of falling back to a generated identity.
+    page.set_content(_FORM_WITH_GOOGLE_OAUTH_BUTTON_THAT_NAVIGATES_AWAY)
+    store, run_logger = _store_and_logger(tmp_path)
+    google_config = replace(config, google_profile_dir="/fake/profile-dir", allow_google_oauth=True)
+
+    result = run_registration(page, store, run_logger, config=google_config)
+
+    assert result.submitted is True
+    assert page.title() == "oauth-clicked"
+    store.close()
+
+
+def test_still_skips_non_google_oauth_button_when_google_profile_is_configured(
+    tmp_path: Path, page: Page, config: Config
+) -> None:
+    # allow_google_oauth is Google-specific, not a blanket "click any OAuth
+    # button" switch -- the persistent profile only has a Google session, so
+    # Facebook/Microsoft/etc. buttons must stay routed around exactly as
+    # before.
+    page.set_content(_FORM_WITH_FACEBOOK_OAUTH_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+    google_config = replace(config, google_profile_dir="/fake/profile-dir", allow_google_oauth=True)
+
+    result = run_registration(page, store, run_logger, config=google_config)
 
     assert result.submitted is True
     assert page.title() == "submitted"

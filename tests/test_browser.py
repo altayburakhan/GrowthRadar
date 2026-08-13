@@ -1,3 +1,6 @@
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
@@ -10,6 +13,26 @@ from growthradar.config import Config
 @pytest.fixture
 def config() -> Config:
     return Config.from_env(env_path="/nonexistent/.env")
+
+
+def _skip_if_chrome_unavailable(session: BrowserSession) -> None:
+    # channel="chrome" needs a real, separately-installed Google Chrome
+    # (`playwright install chrome`) -- not the bundled Chromium every other
+    # test in this file uses. Skip rather than fail where it isn't present
+    # (e.g. this sandbox), consistent with testing the real browser instead
+    # of mocking Playwright's launch API.
+    try:
+        session.start()
+    except PlaywrightError as exc:
+        # start() can raise after already creating self._playwright (the
+        # channel="chrome" launch itself is what fails) -- close() must run
+        # before skip()/raise or that driver process leaks and silently
+        # breaks every later test's sync_playwright() call in this session
+        # ("Playwright Sync API inside the asyncio loop").
+        session.close()
+        if "not found" in str(exc):
+            pytest.skip(f"Google Chrome not installed: {exc}")
+        raise
 
 
 def test_start_is_idempotent(config: Config) -> None:
@@ -152,6 +175,46 @@ def test_goto_clears_requests_from_previous_navigation(config: Config) -> None:
 
         session.goto("data:text/html,<html><body>No images here</body></html>")
         assert all(r.resource_type != "image" for r in session.requests)
+
+
+def test_google_profile_dir_reuses_a_persistent_session_across_runs(
+    tmp_path: Path, config: Config
+) -> None:
+    # The whole point of google_profile_dir: state written by one run (here,
+    # a cookie standing in for a signed-in Google session) must still be
+    # there the next time a BrowserSession points at the same directory --
+    # otherwise every run would need to sign in from scratch, defeating the
+    # purpose of a persistent profile.
+    profile_dir = str(tmp_path / "chrome-profile")
+    profile_config = replace(config, google_profile_dir=profile_dir)
+
+    first = BrowserSession(profile_config)
+    _skip_if_chrome_unavailable(first)
+    try:
+        page = first.page
+        assert page is not None
+        page.goto("data:text/html,<html><body>first run</body></html>")
+        page.context.add_cookies(
+            [
+                {
+                    "name": "growthradar_test_session",
+                    "value": "persisted",
+                    "url": "https://accounts.google.com",
+                }
+            ]
+        )
+    finally:
+        first.close()
+
+    second = BrowserSession(profile_config)
+    try:
+        second.start()
+        cookies = second.page.context.cookies("https://accounts.google.com")  # type: ignore[union-attr]
+        assert any(
+            c["name"] == "growthradar_test_session" and c["value"] == "persisted" for c in cookies
+        )
+    finally:
+        second.close()
 
 
 def test_retry_succeeds_after_transient_failure() -> None:

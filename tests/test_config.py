@@ -52,6 +52,34 @@ def test_invalid_provider_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         Config.from_env(env_path="/nonexistent/.env")
 
 
+def test_google_oauth_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_growthradar_env(monkeypatch)
+
+    config = Config.from_env(env_path="/nonexistent/.env")
+
+    assert config.google_profile_dir is None
+    assert config.allow_google_oauth is False
+
+
+def test_google_oauth_flag_requires_a_profile_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_growthradar_env(monkeypatch)
+    monkeypatch.setenv("GROWTHRADAR_ALLOW_GOOGLE_OAUTH", "true")
+
+    with pytest.raises(ConfigError):
+        Config.from_env(env_path="/nonexistent/.env")
+
+
+def test_google_oauth_enabled_with_profile_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_growthradar_env(monkeypatch)
+    monkeypatch.setenv("GROWTHRADAR_GOOGLE_PROFILE_DIR", "/home/user/.growthradar/chrome-profile")
+    monkeypatch.setenv("GROWTHRADAR_ALLOW_GOOGLE_OAUTH", "true")
+
+    config = Config.from_env(env_path="/nonexistent/.env")
+
+    assert config.google_profile_dir == "/home/user/.growthradar/chrome-profile"
+    assert config.allow_google_oauth is True
+
+
 def test_weights_must_sum_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_growthradar_env(monkeypatch)
     monkeypatch.setenv("GROWTHRADAR_WEIGHT_ICP_FIT", "0.5")

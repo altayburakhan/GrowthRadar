@@ -39,6 +39,18 @@ class Config:
     registrant_first_name: str | None
     registrant_last_name: str | None
 
+    # Reuse a persistent, already-authenticated Google Chrome profile so
+    # "Continue with Google" buttons can be clicked instead of skipped (see
+    # registration.py's _is_oauth_button). The login itself is never
+    # scripted here -- Google's 2FA/verification challenges need a real
+    # human once, out of band (see scripts/google_profile_bootstrap.py) --
+    # this only points the browser at a profile directory that's already
+    # signed in. `allow_google_oauth` is a separate, explicit opt-in on top
+    # of a configured profile dir: setting a profile dir alone should never
+    # silently change what a run clicks.
+    google_profile_dir: str | None
+    allow_google_oauth: bool
+
     hot_threshold: float
     warm_threshold: float
     weight_icp_fit: float
@@ -57,6 +69,11 @@ class Config:
             raise ConfigError("GROWTHRADAR_MAX_PAGES must be > 0")
         if self.crawl_delay < 0:
             raise ConfigError("GROWTHRADAR_CRAWL_DELAY must be >= 0")
+        if self.allow_google_oauth and not self.google_profile_dir:
+            raise ConfigError(
+                "GROWTHRADAR_ALLOW_GOOGLE_OAUTH requires GROWTHRADAR_GOOGLE_PROFILE_DIR "
+                "(a profile with no signed-in Google session can't complete OAuth)"
+            )
         if not (0 <= self.warm_threshold <= self.hot_threshold):
             raise ConfigError("GROWTHRADAR_WARM_THRESHOLD must be <= GROWTHRADAR_HOT_THRESHOLD")
         weight_sum = (
@@ -112,6 +129,9 @@ class Config:
                 registrant_email=_get_optional("GROWTHRADAR_EMAIL"),
                 registrant_first_name=_get_optional("GROWTHRADAR_FIRST_NAME"),
                 registrant_last_name=_get_optional("GROWTHRADAR_LAST_NAME"),
+                google_profile_dir=_get_optional("GROWTHRADAR_GOOGLE_PROFILE_DIR"),
+                allow_google_oauth=_get("GROWTHRADAR_ALLOW_GOOGLE_OAUTH", "false").lower()
+                in ("1", "true", "yes"),
                 hot_threshold=float(_get("GROWTHRADAR_HOT_THRESHOLD", "70")),
                 warm_threshold=float(_get("GROWTHRADAR_WARM_THRESHOLD", "40")),
                 weight_icp_fit=float(_get("GROWTHRADAR_WEIGHT_ICP_FIT", "0.30")),
