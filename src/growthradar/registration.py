@@ -1172,7 +1172,7 @@ def _click_across_frames(page: Page, fn: Callable[[Frame], bool]) -> bool:
     return False
 
 
-def _switch_to_new_page(page: Page, pages_before: int) -> Page:
+def _switch_to_new_page(page: Page, pages_before: int, store: EvidenceStore, run_id: str) -> Page:
     """If the last click opened a new tab/window (page.context.pages grew),
     continue on the newest one instead of the stale original.
 
@@ -1183,6 +1183,12 @@ def _switch_to_new_page(page: Page, pages_before: int) -> Page:
     observed run wandering as far as a help-center "Training Hub" page --
     for the rest of its step budget, having already wrongly recorded the
     click as a successful submission.
+
+    Screenshots the new tab right after switching -- without this, the only
+    screenshots on record are "before any clicks" and "after the whole
+    step budget", so the handoff itself (what the new tab actually looked
+    like the moment we arrived) was otherwise never visible in the
+    dashboard/report even when following it worked correctly.
     """
     try:
         pages = page.context.pages
@@ -1195,6 +1201,9 @@ def _switch_to_new_page(page: Page, pages_before: int) -> Page:
         new_page.bring_to_front()
     with suppress(PlaywrightError):
         new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+    capture_and_record(
+        new_page, store, run_id, ScreenshotKind.REGISTRATION, "registration opened a new tab"
+    )
     return new_page
 
 
@@ -1322,7 +1331,7 @@ def _run_registration(
             # next (an account chooser, a consent screen) is just more pages
             # for this same loop to keep handling on a later iteration.
             steps_completed += 1
-            page = _switch_to_new_page(page, pages_before)
+            page = _switch_to_new_page(page, pages_before, store, run_logger.run_id)
             wait_for_stable(page)
             submitted = True
             continue
@@ -1355,7 +1364,7 @@ def _run_registration(
                     ),
                 )
                 steps_completed += 1
-                page = _switch_to_new_page(page, pages_before)
+                page = _switch_to_new_page(page, pages_before, store, run_logger.run_id)
                 wait_for_stable(page)
                 if clicked:
                     submitted = True
@@ -1400,7 +1409,7 @@ def _run_registration(
                 ),
             )
         )
-        page = _switch_to_new_page(page, pages_before)
+        page = _switch_to_new_page(page, pages_before, store, run_logger.run_id)
 
         if not made_progress and not clicked:
             # Nothing found anywhere yet -- could be genuinely stuck, or
