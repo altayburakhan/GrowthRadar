@@ -90,7 +90,7 @@ _FIELD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("date_of_birth", ("date of birth", "birth date", "birthday", "dob")),
     ("phone", ("phone", "mobile", "telephone")),
     ("website", ("website", "web site", "url")),
-    ("full_name", ("full name", "your name")),
+    ("full_name", ("full name", "fullname", "full-name", "your name")),
 )
 
 _SUBMIT_BUTTON_TEXTS: tuple[str, ...] = (
@@ -103,6 +103,13 @@ _SUBMIT_BUTTON_TEXTS: tuple[str, ...] = (
     "Register",
     "Submit",
 )
+# A code-confirmation screen's button almost never says any of the above --
+# "Verify"/"Confirm" specifically, not a generic signup CTA -- so
+# _fill_verification_code's submit click needs its own list layered on top,
+# not a global change to _SUBMIT_BUTTON_TEXTS (which would risk a "Verify"
+# button winning a match somewhere it shouldn't, e.g. an unrelated identity
+# check earlier in a wizard).
+_CODE_CONFIRM_BUTTON_TEXTS: tuple[str, ...] = (*_SUBMIT_BUTTON_TEXTS, "Verify", "Confirm")
 
 # See _check_consent_checkboxes: only check a box whose label matches one of
 # these AND none of _SKIP_CHECKBOX_KEYWORDS -- mandatory legal consent, never
@@ -151,6 +158,7 @@ class RegistrationResult:
     submitted: bool
     verification_link_opened: bool
     email_verification_required: bool = False
+    verification_code_entered: bool = False
     error: str | None = None
 
 
@@ -563,7 +571,11 @@ _CLICKABLE_SELECTOR = 'button, a, [role="button"]'
 
 
 def _click_submit(
-    frame: Frame, *, allow_reclaim: bool = False, allow_google_oauth: bool = False
+    frame: Frame,
+    *,
+    allow_reclaim: bool = False,
+    allow_google_oauth: bool = False,
+    button_texts: tuple[str, ...] = _SUBMIT_BUTTON_TEXTS,
 ) -> bool:
     # A CSS selector, not get_by_role(name=..., exact=False): Playwright's
     # substring matching there requires our target phrase to appear as an
@@ -580,7 +592,7 @@ def _click_submit(
     except PlaywrightError:
         return False
 
-    for text in _SUBMIT_BUTTON_TEXTS:
+    for text in button_texts:
         target_words = _words(text)
         for i in range(count):
             candidate = candidates.nth(i)
@@ -669,14 +681,42 @@ _CONTINUE_WITH_EMAIL_KEYWORDS: tuple[str, ...] = (
 )
 
 
+def _words_in_order_near(
+    target_words: list[str], candidate_words: list[str], *, max_gap: int = 1
+) -> bool:
+    """True if target_words all appear in candidate_words, in the same
+    relative order, with at most `max_gap` other words between each
+    consecutive pair. Stricter than a plain set-subset match: still
+    tolerates a real site inserting a word into the target phrase ("Sign up
+    with *your* email", seen live on dialpad.com -- one word, matches with
+    max_gap=1), but rejects a candidate that merely happens to contain the
+    same words scattered across an unrelated sentence (seen live on
+    joinhomebase.com: "Sign in with your phone or email" -- a phone/email
+    login chooser for an *existing* employee account, not an OAuth-vs-email
+    chooser -- matched target "sign in with email" under plain set-subset
+    matching purely because "your phone or" doesn't stop any of those four
+    words from being present *somewhere*, and sent registration down the
+    wrong branch of a 2-option screen entirely)."""
+    idx = 0
+    last_pos: int | None = None
+    for word in target_words:
+        try:
+            pos = candidate_words.index(word, idx)
+        except ValueError:
+            return False
+        if last_pos is not None and pos - last_pos - 1 > max_gap:
+            return False
+        last_pos = pos
+        idx = pos + 1
+    return True
+
+
 def _is_continue_with_email(text: str) -> bool:
-    # Word-subset match (not a plain substring check), same reasoning as
-    # _is_submit_like/_click_submit: real copy inserts words into the target
-    # phrase ("Sign up with *your* email", seen live on dialpad.com), which
-    # breaks a contiguous substring match even though every target word is
-    # present.
-    words = _words(text)
-    return any(_words(keyword) <= words for keyword in _CONTINUE_WITH_EMAIL_KEYWORDS)
+    candidate_words = text.lower().split()
+    return any(
+        _words_in_order_near(keyword.split(), candidate_words)
+        for keyword in _CONTINUE_WITH_EMAIL_KEYWORDS
+    )
 
 
 def _click_continue_with_email(frame: Frame) -> bool:
@@ -701,6 +741,135 @@ def _click_continue_with_email(frame: Frame) -> bool:
             continue
         _claim(candidate)
         return True
+    return False
+
+
+def _is_google_oauth_candidate(locator: Locator) -> bool:
+    # Same "names Google and only Google" test _is_oauth_button uses to
+    # decide whether to stop excluding a button -- factored out so the
+    # priority click below and the exclusion check agree on what counts.
+    lowered = _clickable_text(locator).lower()
+    matched_providers = [keyword for keyword in _OAUTH_BUTTON_KEYWORDS if keyword in lowered]
+    return matched_providers == ["google"]
+
+
+def _click_google_oauth_button(frame: Frame) -> bool:
+    """Click a bare "Google" (or "Continue with Google") button before
+    anything else gets a chance to run this iteration.
+
+    Only called when allow_google_oauth is on (see _run_registration).
+    Without this, a page offering *both* a fillable email form and a Google
+    button (seen live on joinblink.com: "Start your free trial" next to a
+    plain "Google" button) always went the email route -- _fill_visible_
+    fields fills the email field unconditionally, and _click_submit's
+    phrase-matching finds "Start your free trial" before ever considering a
+    button whose entire text is just "Google", which matches none of
+    _SUBMIT_BUTTON_TEXTS at all. The whole point of allow_google_oauth is to
+    complete the real Google identity instead of a generated one that then
+    dead-ends on a verification code sent to a fake inbox, so this has to
+    run before the fill step, not compete with it.
+    """
+    try:
+        candidates = frame.locator(_CLICKABLE_SELECTOR)
+        count = candidates.count()
+    except PlaywrightError:
+        return False
+
+    for i in range(count):
+        candidate = candidates.nth(i)
+        try:
+            if not candidate.is_visible() or _is_claimed(candidate):
+                continue
+        except PlaywrightError:
+            continue
+        if not _is_google_oauth_candidate(candidate):
+            continue
+        try:
+            candidate.click(timeout=3000)
+        except PlaywrightError:
+            continue
+        _claim(candidate)
+        return True
+    return False
+
+
+# Deliberately more specific than just "code" -- a bare "code" hint would
+# also match "zip code"/"postal code"/"promo code"/"country code" fields,
+# none of which are an email-verification step.
+_CODE_FIELD_HINTS: tuple[str, ...] = (
+    "verification code",
+    "one-time code",
+    "one time code",
+    "confirmation code",
+    "security code",
+    "otp",
+)
+_CODE_PAGE_PHRASES: tuple[str, ...] = (
+    "verification code",
+    "enter your code",
+    "enter the code",
+    "one-time code",
+    "one time code",
+    "confirmation code",
+    "digit code",
+)
+
+
+def _otp_box_candidates(frame: Frame) -> list[Locator]:
+    # A row of single-character inputs (maxlength="1") is the standard
+    # "6 separate boxes" OTP widget (seen live on joinblink.com) -- there's
+    # no name/placeholder/label to match on for these, just this shape.
+    try:
+        candidates = frame.locator('input[maxlength="1"]')
+        count = candidates.count()
+    except PlaywrightError:
+        return []
+    boxes: list[Locator] = []
+    for i in range(count):
+        candidate = candidates.nth(i)
+        try:
+            if candidate.is_visible() and not _is_claimed(candidate):
+                boxes.append(candidate)
+        except PlaywrightError:
+            continue
+    return boxes
+
+
+def _code_entry_visible(page: Page) -> bool:
+    """Both a code-flavored phrase in the page text AND a matching field --
+    same "never conclude from one signal" reasoning as
+    _email_verification_required: page copy alone ("verification code")
+    could still be marketing text on a page with nothing to fill."""
+    try:
+        text = page.inner_text("body").lower()
+    except PlaywrightError:
+        return False
+    if not any(phrase in text for phrase in _CODE_PAGE_PHRASES):
+        return False
+    for frame in page.frames:
+        if _otp_box_candidates(frame):
+            return True
+        if _find_field(frame, _CODE_FIELD_HINTS) is not None:
+            return True
+    return False
+
+
+def _fill_verification_code(page: Page, code: str) -> bool:
+    for frame in page.frames:
+        boxes = _otp_box_candidates(frame)
+        if len(boxes) == len(code):
+            for box, digit in zip(boxes, code, strict=True):
+                if not _set_field_value(box, digit):
+                    return False
+                _claim(box)
+            return True
+
+    for frame in page.frames:
+        field = _find_field(frame, _CODE_FIELD_HINTS)
+        if field is not None and _set_field_value(field, code):
+            _claim(field)
+            return True
+
     return False
 
 
@@ -1094,6 +1263,8 @@ def _run_registration(
     vision_attempts = 0
     empty_retries = 0
     email_verification_required = False
+    code_verification_attempted = False
+    verification_code_entered = False
     for _ in range(max_steps):
         dismiss_overlays(page)
 
@@ -1113,6 +1284,54 @@ def _run_registration(
                 "registration blocked by anti-bot challenge (captcha)",
             )
             break
+
+        if allow_google_oauth and _click_across_frames(page, _click_google_oauth_button):
+            # Beats the fill step below on purpose (see
+            # _click_google_oauth_button): a page offering both a fillable
+            # email form and a Google button must not fill+submit the
+            # generated identity first. Treated the same as a successful
+            # _click_submit click further down -- this *is* the submission
+            # action for an OAuth-based signup, and whatever Google shows
+            # next (an account chooser, a consent screen) is just more pages
+            # for this same loop to keep handling on a later iteration.
+            steps_completed += 1
+            wait_for_stable(page)
+            submitted = True
+            continue
+
+        if (
+            temp_email_provider is not None
+            and inbox is not None
+            and not code_verification_attempted
+            and _code_entry_visible(page)
+        ):
+            # A site can email a 6-digit code instead of (or on top of) a
+            # clickable link -- seen live on joinblink.com, which lands
+            # directly on this screen right after the initial signup step,
+            # no link to open at all. Tried once per run, same reasoning as
+            # _MAX_VISION_ATTEMPTS: if the code never arrives or the fields
+            # can't be filled, retrying the exact same screen every
+            # iteration just burns the step budget for no reason.
+            code_verification_attempted = True
+            code = temp_email_provider.wait_for_verification_code(inbox)
+            if code and _fill_verification_code(page, code):
+                verification_code_entered = True
+                run_logger.action("verification_code_entered", code_length=len(code))
+                clicked = _click_across_frames(
+                    page,
+                    partial(
+                        _click_submit,
+                        allow_reclaim=True,
+                        allow_google_oauth=allow_google_oauth,
+                        button_texts=_CODE_CONFIRM_BUTTON_TEXTS,
+                    ),
+                )
+                steps_completed += 1
+                wait_for_stable(page)
+                if clicked:
+                    submitted = True
+                continue
+            run_logger.error("verification code not received or code field not found")
 
         filled = _fill_across_frames(page, lambda f: _fill_visible_fields(f, identity))
         filled += _fill_across_frames(page, _fill_unclaimed_empty_selects)
@@ -1231,8 +1450,12 @@ def _run_registration(
     )
     run_logger.action("registration_steps_completed", steps=steps_completed, submitted=submitted)
 
-    verification_opened = _maybe_open_verification_link(
-        page, store, run_logger, inbox, temp_email_provider, submitted=submitted
+    verification_opened = (
+        False
+        if verification_code_entered
+        else _maybe_open_verification_link(
+            page, store, run_logger, inbox, temp_email_provider, submitted=submitted
+        )
     )
 
     store.add(
@@ -1243,6 +1466,7 @@ def _run_registration(
             "steps_completed": steps_completed,
             "submitted": submitted,
             "verification_link_opened": verification_opened,
+            "verification_code_entered": verification_code_entered,
             "email_verification_required": email_verification_required,
             "email": identity.email,
             "company_name": identity.company_name,
@@ -1256,6 +1480,7 @@ def _run_registration(
         submitted=submitted,
         verification_link_opened=verification_opened,
         email_verification_required=email_verification_required,
+        verification_code_entered=verification_code_entered,
     )
 
 

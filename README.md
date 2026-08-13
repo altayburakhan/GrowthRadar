@@ -157,7 +157,8 @@ raises `ConfigError` with a clear message if something's wrong.
 | `GROWTHRADAR_LOG_LEVEL` | `INFO` | Console log level |
 | `GROWTHRADAR_COUNTRY` | `United States` | Country value used to fill signup/free-trial forms (registration.py handles both text inputs and `<select>` dropdowns) |
 | `GROWTHRADAR_COMPANY` | — | Fixed company name for signup forms; leave blank to get a random generated one each run |
-| `GROWTHRADAR_EMAIL` | — | Real address to use for signup forms (plus-tagged per run, e.g. `you+ab12cd@x.com`, so repeated runs against the same site don't collide on "already registered"); leave blank for a random `@example.com` address. Needed for sites that reject non-work-email domains |
+| `GROWTHRADAR_EMAIL` | — | Real address to use for signup forms, used verbatim on every run (not plus-tagged -- repeated runs against the same site can hit "already registered", an accepted tradeoff); leave blank for a random `@example.com` address. Needed for sites that reject non-work-email domains. Overridden by `GROWTHRADAR_GMAIL_ADDRESS` below when both are set |
+| `GROWTHRADAR_GMAIL_ADDRESS` / `GROWTHRADAR_GMAIL_APP_PASSWORD` | — | A real Gmail inbox read over IMAP (an app password, not your account password -- generate one at myaccount.google.com/apppasswords) so registration.py can open a verification link or type in a code instead of stalling. Each run gets its own `+tag` alias of this address |
 | `GROWTHRADAR_GOOGLE_PROFILE_DIR` | — | Path to a persistent Chrome profile with an already-signed-in Google session (create one with `scripts/google_profile_bootstrap.py`) |
 | `GROWTHRADAR_ALLOW_GOOGLE_OAUTH` | `false` | With a profile dir set, click "Continue with Google" instead of routing around it. Google-only -- Facebook/Microsoft/etc. OAuth buttons are still always skipped |
 | `GROWTHRADAR_HOT_THRESHOLD` / `WARM_THRESHOLD` | `70` / `40` | Overall-score cutoffs for the Hot/Warm/Cold verdict |

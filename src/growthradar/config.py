@@ -39,6 +39,15 @@ class Config:
     registrant_first_name: str | None
     registrant_last_name: str | None
 
+    # Real Gmail inbox for reading email-verification links/codes over IMAP
+    # (see temp_email.py's GmailImapProvider) -- an app password, not the
+    # account password (requires 2FA; generate one at
+    # myaccount.google.com/apppasswords). Never touches a browser or
+    # Google's own login/OAuth pages, so it's unaffected by the automation
+    # detection that blocks google_profile_dir's OAuth flow.
+    gmail_address: str | None
+    gmail_app_password: str | None
+
     # Reuse a persistent, already-authenticated Google Chrome profile so
     # "Continue with Google" buttons can be clicked instead of skipped (see
     # registration.py's _is_oauth_button). The login itself is never
@@ -106,6 +115,12 @@ class Config:
             value = _get(name)
             return value or None
 
+        def _get_app_password(name: str) -> str | None:
+            # Google shows app passwords space-grouped for readability
+            # ("abcd efgh ijkl mnop") -- IMAP auth needs it without spaces.
+            value = _get_optional(name)
+            return value.replace(" ", "") if value else None
+
         try:
             return cls(
                 groq_api_key=_get_optional("GROQ_API_KEY"),
@@ -129,6 +144,8 @@ class Config:
                 registrant_email=_get_optional("GROWTHRADAR_EMAIL"),
                 registrant_first_name=_get_optional("GROWTHRADAR_FIRST_NAME"),
                 registrant_last_name=_get_optional("GROWTHRADAR_LAST_NAME"),
+                gmail_address=_get_optional("GROWTHRADAR_GMAIL_ADDRESS"),
+                gmail_app_password=_get_app_password("GROWTHRADAR_GMAIL_APP_PASSWORD"),
                 google_profile_dir=_get_optional("GROWTHRADAR_GOOGLE_PROFILE_DIR"),
                 allow_google_oauth=_get("GROWTHRADAR_ALLOW_GOOGLE_OAUTH", "false").lower()
                 in ("1", "true", "yes"),

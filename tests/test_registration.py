@@ -106,6 +106,25 @@ _FORM_WITH_GOOGLE_OAUTH_BUTTON_THAT_NAVIGATES_AWAY = """
 </body></html>
 """
 
+# Regression (joinblink.com): a fillable email form and a bare "Google"
+# button side by side -- unlike _FORM_WITH_OAUTH_BUTTON's "Continue with
+# Google" (which _click_submit's phrase matching considers, then routes
+# around), a button whose entire text is "Google" doesn't match any
+# _SUBMIT_BUTTON_TEXTS phrase at all, so it's never found by the normal
+# fill-then-submit path -- allow_google_oauth must click it before the email
+# field ever gets filled, not compete with _click_submit for priority.
+_FORM_WITH_EMAIL_FORM_AND_BARE_GOOGLE_BUTTON = """
+<html><body>
+<div id="form">
+<input name="email" type="email" placeholder="name@company.com" />
+<button onclick="document.title='submitted';">Start your free trial</button>
+<button onclick="document.title='oauth-clicked'; document.getElementById('form').remove();">
+  Google
+</button>
+</div>
+</body></html>
+"""
+
 _FORM_WITH_INSERTED_WORD_BUTTON = """
 <html><body>
 <input name="email" type="email" placeholder="Email" />
@@ -297,6 +316,36 @@ def test_still_skips_non_google_oauth_button_when_google_profile_is_configured(
     google_config = replace(config, google_profile_dir="/fake/profile-dir", allow_google_oauth=True)
 
     result = run_registration(page, store, run_logger, config=google_config)
+
+    assert result.submitted is True
+    assert page.title() == "submitted"
+    store.close()
+
+
+def test_prefers_bare_google_button_over_filling_a_sibling_email_form(
+    tmp_path: Path, page: Page, config: Config
+) -> None:
+    page.set_content(_FORM_WITH_EMAIL_FORM_AND_BARE_GOOGLE_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+    google_config = replace(config, google_profile_dir="/fake/profile-dir", allow_google_oauth=True)
+
+    result = run_registration(page, store, run_logger, config=google_config)
+
+    assert result.submitted is True
+    assert page.title() == "oauth-clicked"
+    store.close()
+
+
+def test_fills_email_form_when_google_oauth_not_allowed(
+    tmp_path: Path, page: Page, config: Config
+) -> None:
+    # Without allow_google_oauth (the default), the same page must behave
+    # exactly as it always has: fill the email field and submit through it,
+    # never touching the Google button.
+    page.set_content(_FORM_WITH_EMAIL_FORM_AND_BARE_GOOGLE_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, config=config)
 
     assert result.submitted is True
     assert page.title() == "submitted"
@@ -499,6 +548,32 @@ def test_fills_bare_name_label_and_confirm_password_field(tmp_path: Path, page: 
     store.close()
 
 
+# Regression (joinhomebase.com): a real field name="fullName" (camelCase, no
+# space) wasn't matched by full_name's keyword list, which only had "full
+# name" (with a space) and "your name" -- unlike first_name/last_name, which
+# both already carry a no-space variant ("firstname"/"lastname") alongside
+# the spaced one. The button stayed disabled with the field empty, and
+# nothing else on the page for the loop to fall back to.
+_FORM_WITH_CAMEL_CASE_FULL_NAME_FIELD = """
+<html><body>
+<p>What should we call you?</p>
+<input name="fullName" placeholder="ex: Jane Smith" />
+<button onclick="document.title='submitted';">Get started</button>
+</body></html>
+"""
+
+
+def test_fills_camel_case_full_name_field(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_WITH_CAMEL_CASE_FULL_NAME_FIELD)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert page.locator('input[name="fullName"]').input_value() == result.identity.full_name
+    assert result.submitted is True
+    store.close()
+
+
 # Mirrors Synder's real signup form (reached from cloudbusinesshq.com): an
 # auth-method chooser with OAuth/SSO/integration buttons plus one "Continue
 # with Email" option. Clicking it reveals -- on the *same* page, no
@@ -589,6 +664,44 @@ def test_clicks_continue_with_email_button_with_a_word_inserted_into_the_target_
     store.close()
 
 
+# Regression (joinhomebase.com): a persona-picker screen offering "Set up a
+# new business" (the real signup path) next to "Sign in with your phone or
+# email" (an *existing employee's* login, an entirely different flow) --
+# under plain word-subset matching, "sign in with email" (a target phrase
+# meaning "prefer email over OAuth") matched the phone/email chooser too,
+# since "your phone or" sitting between "with" and "email" doesn't stop all
+# four target words from being present *somewhere*. Sent registration down
+# the wrong branch of the screen every time, never reaching a fillable form.
+_PERSONA_PICKER_WITH_UNRELATED_SIGN_IN_LINK = """
+<html><body>
+<a href="#" onclick="
+    document.getElementById('picker').style.display='none';
+    document.getElementById('owner-form').style.display='block';
+  ">Set up a new business</a>
+<a href="#" onclick="document.title='wrong-branch-clicked';">Sign in with your phone or email</a>
+<div id="picker"></div>
+<div id="owner-form" style="display:none">
+  <input name="email" type="email" placeholder="Email" />
+  <input name="password" type="password" placeholder="Password" />
+  <button onclick="document.title='submitted';">Sign up</button>
+</div>
+</body></html>
+"""
+
+
+def test_persona_picker_prefers_new_business_over_unrelated_sign_in_link(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_PERSONA_PICKER_WITH_UNRELATED_SIGN_IN_LINK)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    assert page.title() == "submitted"
+    store.close()
+
+
 def test_fills_country_select_dropdown_via_exact_label_match(tmp_path: Path, page: Page) -> None:
     page.set_content(_FORM_WITH_COUNTRY_DROPDOWN)
     store, run_logger = _store_and_logger(tmp_path)
@@ -631,9 +744,12 @@ def test_records_registration_evidence_and_screenshots(tmp_path: Path, page: Pag
 
 
 class _FakeTempEmailProvider:
-    def __init__(self, address: str = "fake@temp.example", link: str | None = None) -> None:
+    def __init__(
+        self, address: str = "fake@temp.example", link: str | None = None, code: str | None = None
+    ) -> None:
         self.address = address
         self.link = link
+        self.code = code
         self.create_inbox_called = False
 
     def create_inbox(self) -> TempInbox | None:
@@ -644,6 +760,9 @@ class _FakeTempEmailProvider:
         self, inbox: TempInbox, *, timeout: float = 60.0, keyword: str = "verify"
     ) -> str | None:
         return self.link
+
+    def wait_for_verification_code(self, inbox: TempInbox, *, timeout: float = 60.0) -> str | None:
+        return self.code
 
 
 def test_opens_verification_link_when_provided(tmp_path: Path, page: Page) -> None:
@@ -671,6 +790,88 @@ def test_missing_verification_email_does_not_fail_registration(tmp_path: Path, p
     assert result.submitted is True
     assert result.verification_link_opened is False
     assert result.error is None
+    store.close()
+
+
+# Regression (joinblink.com): lands directly on a "check your inbox, enter
+# the 6-digit code" screen right after the initial signup step, with no
+# link to open at all -- six separate maxlength="1" boxes, the standard
+# widget shape for this pattern.
+_OTP_BOX_CODE_ENTRY_PAGE = """
+<html><body>
+<h1>Enter your code</h1>
+<p>We sent a verification code to your email. Enter it below.</p>
+<input maxlength="1" />
+<input maxlength="1" />
+<input maxlength="1" />
+<input maxlength="1" />
+<input maxlength="1" />
+<input maxlength="1" />
+<button onclick="document.title='verified';">Continue</button>
+</body></html>
+"""
+
+_SINGLE_FIELD_CODE_ENTRY_PAGE = """
+<html><body>
+<h1>Enter your code</h1>
+<p>Please enter the one-time code we emailed you.</p>
+<input name="otp" placeholder="One-time code" />
+<button onclick="document.title='verified';">Verify</button>
+</body></html>
+"""
+
+# Regression guard: page copy alone must not be enough -- no code field
+# exists here (only a plain email form), so this must go through the
+# ordinary fill+submit path untouched.
+_PAGE_MENTIONING_CODE_WITH_NO_CODE_FIELD = """
+<html><body>
+<p>After signing up you'll receive a verification code by email.</p>
+<input name="email" type="email" placeholder="Email" />
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+
+def test_enters_verification_code_into_otp_boxes(tmp_path: Path, page: Page) -> None:
+    page.set_content(_OTP_BOX_CODE_ENTRY_PAGE)
+    store, run_logger = _store_and_logger(tmp_path)
+    provider = _FakeTempEmailProvider(code="483920")
+
+    result = run_registration(page, store, run_logger, temp_email_provider=provider)
+
+    boxes = page.locator('input[maxlength="1"]')
+    values = [boxes.nth(i).input_value() for i in range(boxes.count())]
+    assert values == list("483920")
+    assert result.verification_code_entered is True
+    assert result.submitted is True
+    assert page.title() == "verified"
+    store.close()
+
+
+def test_enters_verification_code_into_a_single_field(tmp_path: Path, page: Page) -> None:
+    page.set_content(_SINGLE_FIELD_CODE_ENTRY_PAGE)
+    store, run_logger = _store_and_logger(tmp_path)
+    provider = _FakeTempEmailProvider(code="192837")
+
+    result = run_registration(page, store, run_logger, temp_email_provider=provider)
+
+    assert page.eval_on_selector('input[name="otp"]', "el => el.value") == "192837"
+    assert result.verification_code_entered is True
+    assert result.submitted is True
+    assert page.title() == "verified"
+    store.close()
+
+
+def test_does_not_treat_a_plain_email_form_as_a_code_entry_step(tmp_path: Path, page: Page) -> None:
+    page.set_content(_PAGE_MENTIONING_CODE_WITH_NO_CODE_FIELD)
+    store, run_logger = _store_and_logger(tmp_path)
+    provider = _FakeTempEmailProvider(code="000000")
+
+    result = run_registration(page, store, run_logger, temp_email_provider=provider)
+
+    assert result.verification_code_entered is False
+    assert result.submitted is True
+    assert page.title() == "submitted"
     store.close()
 
 

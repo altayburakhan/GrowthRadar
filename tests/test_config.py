@@ -80,6 +80,26 @@ def test_google_oauth_enabled_with_profile_dir(monkeypatch: pytest.MonkeyPatch) 
     assert config.allow_google_oauth is True
 
 
+def test_gmail_fields_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_growthradar_env(monkeypatch)
+
+    config = Config.from_env(env_path="/nonexistent/.env")
+
+    assert config.gmail_address is None
+    assert config.gmail_app_password is None
+
+
+def test_gmail_app_password_spaces_are_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_growthradar_env(monkeypatch)
+    monkeypatch.setenv("GROWTHRADAR_GMAIL_ADDRESS", "user@gmail.com")
+    monkeypatch.setenv("GROWTHRADAR_GMAIL_APP_PASSWORD", "abcd efgh ijkl mnop")
+
+    config = Config.from_env(env_path="/nonexistent/.env")
+
+    assert config.gmail_address == "user@gmail.com"
+    assert config.gmail_app_password == "abcdefghijklmnop"
+
+
 def test_weights_must_sum_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_growthradar_env(monkeypatch)
     monkeypatch.setenv("GROWTHRADAR_WEIGHT_ICP_FIT", "0.5")

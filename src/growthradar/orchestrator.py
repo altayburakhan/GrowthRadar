@@ -62,6 +62,7 @@ from growthradar.registration import (
 from growthradar.report import FinalReport, generate_report, record_report
 from growthradar.scoring import score_run
 from growthradar.screenshot import ScreenshotKind
+from growthradar.temp_email import GmailImapProvider, TempEmailProvider
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +382,18 @@ def _find_registration_page_url(store: EvidenceStore, run_id: str) -> str | None
     return None
 
 
+def _temp_email_provider_from_config(config: Config) -> TempEmailProvider | None:
+    """A real Gmail inbox (read over IMAP, see temp_email.py) when
+    configured, so registration.py can open a verification link or type in
+    a code instead of stalling on "email verification required". Takes
+    priority over a plain GROWTHRADAR_EMAIL override when both are set --
+    that address alone can't be read back, so there's nothing useful to do
+    with it once a readable inbox is available."""
+    if config.gmail_address and config.gmail_app_password:
+        return GmailImapProvider(config.gmail_address, config.gmail_app_password)
+    return None
+
+
 def _attempt_registration(
     session: BrowserSession,
     store: EvidenceStore,
@@ -426,4 +439,5 @@ def _attempt_registration(
         first_name_override=config.registrant_first_name,
         last_name_override=config.registrant_last_name,
         config=config,
+        temp_email_provider=_temp_email_provider_from_config(config),
     )
