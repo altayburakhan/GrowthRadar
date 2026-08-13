@@ -615,6 +615,43 @@ def test_fills_camel_case_full_name_field(tmp_path: Path, page: Page) -> None:
     store.close()
 
 
+# Regression (legalesign.com): right after a successful signup, a
+# dismissible security prompt ("Set up a passkey") shows up with no field to
+# fill -- just its own "commit" CTA and a "Skip for now" dismissal, in that
+# DOM order. Without preferring the dismissal, the generic choice-picker
+# would click "Set up a passkey" first (it's first in the DOM), sending the
+# run into a WebAuthn flow with no way to complete it.
+_FORM_WITH_PASSKEY_PROMPT_AFTER_SIGNUP = """
+<html><body>
+<div id="signup">
+<input name="email" type="email" placeholder="Email" />
+<input name="password" type="password" placeholder="Password" />
+<button onclick="
+    document.getElementById('signup').style.display='none';
+    document.getElementById('passkey').style.display='block';
+  ">Sign up</button>
+</div>
+<div id="passkey" style="display:none">
+<button onclick="document.title='passkey-setup-clicked';">Set up a passkey</button>
+<button onclick="document.title='reached-onboarding'; document.getElementById('passkey').remove();">
+  Skip for now
+</button>
+</div>
+</body></html>
+"""
+
+
+def test_skips_a_passkey_prompt_instead_of_setting_one_up(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_WITH_PASSKEY_PROMPT_AFTER_SIGNUP)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    assert page.title() == "reached-onboarding"
+    store.close()
+
+
 # Mirrors Synder's real signup form (reached from cloudbusinesshq.com): an
 # auth-method chooser with OAuth/SSO/integration buttons plus one "Continue
 # with Email" option. Clicking it reveals -- on the *same* page, no

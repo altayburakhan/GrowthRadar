@@ -744,6 +744,58 @@ def _click_continue_with_email(frame: Frame) -> bool:
     return False
 
 
+# A post-signup security/preference interstitial (seen live on
+# legalesign.com: "Set up a passkey") has no field to fill, just a "commit"
+# button and a dismissal one -- without preferring the dismissal, the
+# generic choice-picker below would click whichever comes first in the DOM,
+# which is often the "commit" CTA (it's usually the visually primary
+# button), sending the run into a WebAuthn/biometric flow it has no way to
+# complete. We're here to reach the onboarding screen, not to opt into every
+# optional security prompt along the way.
+_SKIP_PROMPT_KEYWORDS: tuple[str, ...] = (
+    "skip for now",
+    "not now",
+    "maybe later",
+    "remind me later",
+    "no thanks",
+    "not right now",
+    "ill do this later",
+    "skip",
+)
+
+
+def _is_skip_prompt(text: str) -> bool:
+    candidate_words = text.lower().replace("'", "").split()
+    return any(
+        _words_in_order_near(keyword.split(), candidate_words) for keyword in _SKIP_PROMPT_KEYWORDS
+    )
+
+
+def _click_skip_prompt(frame: Frame) -> bool:
+    try:
+        candidates = frame.locator(_CLICKABLE_SELECTOR)
+        count = candidates.count()
+    except PlaywrightError:
+        return False
+
+    for i in range(count):
+        candidate = candidates.nth(i)
+        try:
+            if not candidate.is_visible() or _is_claimed(candidate):
+                continue
+        except PlaywrightError:
+            continue
+        if not _is_skip_prompt(_clickable_text(candidate).strip()):
+            continue
+        try:
+            candidate.click(timeout=3000)
+        except PlaywrightError:
+            continue
+        _claim(candidate)
+        return True
+    return False
+
+
 def _is_google_oauth_candidate(locator: Locator) -> bool:
     # Same "names Google and only Google" test _is_oauth_button uses to
     # decide whether to stop excluding a button -- factored out so the
@@ -1380,26 +1432,32 @@ def _run_registration(
 
         picked = False
         clicked_email = False
+        skipped_prompt = False
         if filled == 0 and checked_boxes == 0:
             # Nothing to fill or check -- either an auth-method chooser (see
             # _click_continue_with_email, tried first so it's always
-            # preferred over an OAuth/SSO button) or a choice-wizard step
-            # (see _click_unclaimed_choice_option) rather than a plain form.
+            # preferred over an OAuth/SSO button), a dismissible security/
+            # preference prompt (see _click_skip_prompt, e.g. "Set up a
+            # passkey" -- tried next so it's preferred over accidentally
+            # committing to it), or a choice-wizard step (see
+            # _click_unclaimed_choice_option) rather than a plain form.
             clicked_email = _click_across_frames(page, _click_continue_with_email)
             if not clicked_email:
+                skipped_prompt = _click_across_frames(page, _click_skip_prompt)
+            if not clicked_email and not skipped_prompt:
                 picked = _click_unclaimed_choice_option(page, allow_google_oauth=allow_google_oauth)
 
-        made_progress = filled > 0 or checked_boxes > 0 or picked or clicked_email
-        # Clicking "Continue with Email" only reveals the real form (see
-        # cloudbusinesshq.com/Synder) -- it's still empty. Skip _click_submit
-        # this same iteration so it can't find and click a leftover OAuth
-        # button, or the target site's own submit button, before those
-        # fields are filled on the next iteration; that would submit an
-        # empty form and trigger the exact validation errors this project
-        # exists to avoid.
+        made_progress = filled > 0 or checked_boxes > 0 or picked or clicked_email or skipped_prompt
+        # Clicking "Continue with Email"/a skip prompt only reveals the next
+        # screen (see cloudbusinesshq.com/Synder) -- nothing to submit yet.
+        # Skip _click_submit this same iteration so it can't find and click
+        # a leftover OAuth button, or the target site's own submit button,
+        # before those fields are filled on the next iteration; that would
+        # submit an empty form and trigger the exact validation errors this
+        # project exists to avoid.
         clicked = (
             False
-            if clicked_email
+            if (clicked_email or skipped_prompt)
             else _click_across_frames(
                 page,
                 partial(
