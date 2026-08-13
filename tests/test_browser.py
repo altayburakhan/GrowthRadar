@@ -73,6 +73,33 @@ def test_dismiss_overlays_clicks_matching_button(config: Config) -> None:
         assert page.query_selector("#banner") is None
 
 
+def test_dismiss_overlays_clicks_button_inside_a_shadow_root(config: Config) -> None:
+    # Regression (influencity.com): a consent-management widget rendered its
+    # "Privacy Center" modal inside an open shadow root. get_by_role("button",
+    # name=...) found nothing there -- apparently unable to compute an
+    # accessible name for the shadow-hosted button -- even though the button
+    # was visible and clickable via a plain CSS locator.
+    with BrowserSession(config) as session:
+        page = session.start()
+        page.set_content("<html><body><div id='host'></div></body></html>")
+        page.evaluate(
+            """() => {
+                const host = document.getElementById('host');
+                const root = host.attachShadow({mode: 'open'});
+                // this.parentElement, not document.getElementById -- the
+                // shadow root has its own id scope the light-DOM document
+                // can't see into.
+                root.innerHTML = `<div id="modal">
+                    <button onclick="this.parentElement.remove()">Accept</button>
+                </div>`;
+            }"""
+        )
+        assert dismiss_overlays(page, timeout=1.0) is True
+        assert page.evaluate(
+            "() => !document.getElementById('host').shadowRoot.getElementById('modal')"
+        )
+
+
 def test_retry_reraises_after_exhausting_attempts() -> None:
     calls = {"n": 0}
 

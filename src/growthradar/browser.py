@@ -79,12 +79,22 @@ def wait_for_stable(page: Page, timeout: float = 10.0) -> None:
 
 
 def dismiss_overlays(page: Page, timeout: float = 1.2) -> bool:
-    """Best-effort dismissal of cookie banners / consent modals. Never raises."""
+    """Best-effort dismissal of cookie banners / consent modals. Never raises.
+
+    Uses a plain CSS locator (not `get_by_role`) so it also catches consent
+    widgets rendered inside a shadow root -- seen live on influencity.com's
+    "Privacy Center" modal (a Consentiam widget hosted in an open shadow DOM):
+    `get_by_role("button", name="Accept")` found nothing there even though the
+    button was visible and clickable, apparently failing to compute an
+    accessible name for it, while a CSS `:has-text()` match (which Playwright
+    pierces open shadow roots for automatically, same as any other CSS
+    selector) found and clicked it fine.
+    """
     dismissed_any = False
     timeout_ms = timeout * 1000
     for text in _OVERLAY_BUTTON_TEXTS:
         try:
-            locator = page.get_by_role("button", name=text, exact=False)
+            locator = page.locator('button, a, [role="button"]').filter(has_text=text)
             if locator.count() == 0:
                 continue
             locator.first.click(timeout=timeout_ms)
