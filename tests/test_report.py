@@ -337,6 +337,49 @@ def test_to_markdown_shows_competitor_callout(config: Config) -> None:
     assert "switching/replacing" in markdown
 
 
+def test_competitor_tool_evidence_cites_the_page_and_matched_signal(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "js/network: https://acme.com",
+            url="https://acme.com/dashboard",
+            javascript={
+                "detected_tools": [
+                    {
+                        "name": "Pendo",
+                        "category": "onboarding",
+                        "confidence": 0.95,
+                        "matched_scripts": ["https://cdn.pendo.io/agent/static/x/pendo.js"],
+                        "matched_globals": ["pendo"],
+                        "matched_network": [],
+                    },
+                    # Confidence too low -- must not appear as a sighting either.
+                    {
+                        "name": "WalkMe",
+                        "category": "onboarding",
+                        "confidence": 0.4,
+                        "matched_scripts": ["https://cdn.walkme.com/x.js"],
+                    },
+                ]
+            },
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert len(report.competitor_tool_evidence) == 1
+    sighting = report.competitor_tool_evidence[0]
+    assert sighting.name == "Pendo"
+    assert sighting.page_url == "https://acme.com/dashboard"
+    assert sighting.matched_scripts == ("https://cdn.pendo.io/agent/static/x/pendo.js",)
+    assert sighting.matched_globals == ("pendo",)
+    assert sighting.matched_network == ()
+
+    markdown = to_markdown(report)
+    assert "Pendo on https://acme.com/dashboard" in markdown
+    assert "script: https://cdn.pendo.io/agent/static/x/pendo.js" in markdown
+
+
 def test_to_markdown_shows_existing_customer_callout(config: Config) -> None:
     evidence = [
         _evidence(

@@ -35,6 +35,21 @@ _VERDICT_RECOMMENDATIONS: dict[str, str] = {
 
 
 @dataclass(frozen=True)
+class ToolSighting:
+    """Where a single competitor-tool detection actually came from -- the page
+    it was seen on, and which of js_network.py's three independent signals
+    (script URL / window global / network request) matched. Lets a reader
+    verify "it found Pendo" against the concrete evidence instead of taking
+    the name on faith."""
+
+    name: str
+    page_url: str
+    matched_scripts: tuple[str, ...]
+    matched_globals: tuple[str, ...]
+    matched_network: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class FinalReport:
     run_id: str
     company: str
@@ -55,6 +70,7 @@ class FinalReport:
     run_errors: tuple[str, ...] = ()
     llm_summary: str | None = None
     competitor_tools_detected: tuple[str, ...] = ()
+    competitor_tool_evidence: tuple[ToolSighting, ...] = ()
     already_userguiding_customer: bool = False
     email_verification_required: bool = False
 
@@ -160,6 +176,34 @@ def _competitor_tools_detected(evidence: list[Evidence]) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def _competitor_tool_evidence(evidence: list[Evidence]) -> tuple[ToolSighting, ...]:
+    """Per-page provenance for `_competitor_tools_detected`'s names: which
+    page it was seen on, and which of js_network.py's independent signals
+    (script URL / window global / network request) matched -- the "where did
+    it find this" answer a reader needs to trust the name isn't a fluke."""
+    sightings: list[ToolSighting] = []
+    for e in _by_label_prefix(evidence, "js/network:"):
+        if not isinstance(e.javascript, dict) or not e.url:
+            continue
+        for tool in e.javascript.get("detected_tools", []):
+            if tool.get("category", "onboarding") != "onboarding":
+                continue
+            if tool.get("name") == "UserGuiding":
+                continue
+            if tool.get("confidence", 0) < _CONFIDENT_THRESHOLD:
+                continue
+            sightings.append(
+                ToolSighting(
+                    name=str(tool.get("name")),
+                    page_url=e.url,
+                    matched_scripts=tuple(tool.get("matched_scripts", [])),
+                    matched_globals=tuple(tool.get("matched_globals", [])),
+                    matched_network=tuple(tool.get("matched_network", [])),
+                )
+            )
+    return tuple(sightings)
+
+
 def _llm_summary(evidence: list[Evidence]) -> str | None:
     """Read back llm_summary.py's recorded evidence, if any. Reading, not
     calling an LLM here, keeps this module's "no I/O, pure function" contract
@@ -234,6 +278,7 @@ def generate_report(
         evidence_collected=len(evidence),
         technologies_detected=_technologies_detected(evidence),
         competitor_tools_detected=_competitor_tools_detected(evidence),
+        competitor_tool_evidence=_competitor_tool_evidence(evidence),
         already_userguiding_customer=_already_userguiding_customer(score),
         product_update_pages=product_update_pages,
         help_center_url=help_center_urls[0] if help_center_urls else None,
@@ -282,6 +327,17 @@ def to_markdown(report: FinalReport) -> str:
             'around switching/replacing, not "do you need this at all".',
             "",
         ]
+        for sighting in report.competitor_tool_evidence:
+            signals = []
+            if sighting.matched_scripts:
+                signals.append(f"script: {sighting.matched_scripts[0]}")
+            if sighting.matched_globals:
+                signals.append(f"global: {sighting.matched_globals[0]}")
+            if sighting.matched_network:
+                signals.append(f"network: {sighting.matched_network[0]}")
+            detail = "; ".join(signals) or "no signal detail"
+            lines.append(f">   - {sighting.name} on {sighting.page_url} ({detail})")
+        lines.append("")
     lines += [
         f"- **Product**: {report.product_url or 'unknown'}",
         f"- **Explored pages**: {len(report.explored_pages)}",

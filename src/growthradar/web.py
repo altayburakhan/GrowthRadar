@@ -393,6 +393,7 @@ _INDEX_HTML = """<!doctype html>
   .shots .cap { font-size: 11px; color: var(--muted); padding: 6px 8px; }
   .pages { font-size: 13px; }
   .pages li { word-break: break-all; }
+  .muted { color: var(--muted); font-size: 12px; }
   .errors { color: var(--hot); font-size: 13px; margin-top: 10px; }
   .history-item {
     display: flex; justify-content: space-between; gap: 10px; padding: 8px 0;
@@ -509,6 +510,17 @@ function renderReport(data) {
         ? `<div class="recommendation competitor">⚠️ <strong>Rakip arac tespit edildi: ${r.competitor_tools_detected.join(', ')}</strong> -- bu sirketin zaten onboarding arac butcesi var. Mesaji "ihtiyacin var mi"ya degil, degistirme/gecise gore kur.</div>`
         : '');
 
+  const evidenceRows = (r.competitor_tool_evidence || []).map(s => {
+    const signals = [];
+    if (s.matched_scripts && s.matched_scripts.length) signals.push(`script: ${s.matched_scripts[0]}`);
+    if (s.matched_globals && s.matched_globals.length) signals.push(`global: ${s.matched_globals[0]}`);
+    if (s.matched_network && s.matched_network.length) signals.push(`network: ${s.matched_network[0]}`);
+    return `<li><strong>${s.name}</strong> -- ${s.page_url}<br><span class="muted">${signals.join(' · ') || 'sinyal detayi yok'}</span></li>`;
+  }).join('');
+  const competitorEvidenceHtml = evidenceRows
+    ? `<h3 style="font-size:14px;">Rakip arac nereden bulundu?</h3><ul class="pages">${evidenceRows}</ul>`
+    : '';
+
   const emailVerificationHtml = r.email_verification_required
     ? `<div class="recommendation competitor">✉️ <strong>Bu site email dogrulamasi istiyor</strong> -- kayit formu dolduruldu ama hesap, gercek bir gelen kutusundaki linke tiklanmadan aktif olmuyor; otomatik akis burada duruyor.</div>`
     : '';
@@ -541,6 +553,7 @@ function renderReport(data) {
         ${renderBar('Urun deneyimi', r.score.product_experience)}
       </div>
       ${errorsHtml}
+      ${competitorEvidenceHtml}
       <h3 style="font-size:14px;">Ekran goruntuleri</h3>
       ${shotsHtml}
       <h3 style="font-size:14px;">Kesfedilen sayfalar (${r.explored_pages.length})</h3>
