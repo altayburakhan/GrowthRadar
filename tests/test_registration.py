@@ -615,6 +615,35 @@ def test_fills_camel_case_full_name_field(tmp_path: Path, page: Page) -> None:
     store.close()
 
 
+# Regression (onlypult.com): a real email field named/labeled with "mail"
+# instead of "email" -- name="RegisterForm[mail]", id="registerform-mail",
+# label "E-mail" (hyphenated), type="text" (not type="email", so the
+# input_type shortcut in _find_field doesn't catch it either). None of
+# those attributes contain "email" as a contiguous substring, so the field
+# was never matched or filled at all -- left empty, submission blocked.
+_FORM_WITH_MAIL_NAMED_EMAIL_FIELD = """
+<html><body>
+<label for="registerform-mail">E-mail</label>
+<input id="registerform-mail" name="RegisterForm[mail]" type="text"
+  placeholder="example@onlypult.com" />
+<label for="registerform-password">Password</label>
+<input id="registerform-password" name="RegisterForm[password]" type="password" />
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+
+def test_fills_email_field_named_mail_instead_of_email(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_WITH_MAIL_NAMED_EMAIL_FIELD)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert page.locator("#registerform-mail").input_value() == result.identity.email
+    assert result.submitted is True
+    store.close()
+
+
 # Regression (legalesign.com): right after a successful signup, a
 # dismissible security prompt ("Set up a passkey") shows up with no field to
 # fill -- just its own "commit" CTA and a "Skip for now" dismissal, in that

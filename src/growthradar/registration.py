@@ -69,7 +69,13 @@ _CLAIMED_MARKER = "data-growthradar-filled"
 # conceptboard.com: "Confirm password" was left empty, and the site's own
 # "Passwords do not match" validation blocked submission).
 _FIELD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("email", ("email",)),
+    # "e-mail"/"mail" alongside "email" -- seen live on onlypult.com:
+    # name="RegisterForm[mail]", id="registerform-mail", label "E-mail"
+    # (hyphenated), input type="text" (not type="email", so the input_type
+    # shortcut in _find_field doesn't catch it either). None of those
+    # attributes contain "email" as a contiguous substring, so the field was
+    # never matched or filled at all.
+    ("email", ("email", "e-mail", "mail")),
     (
         "confirm_password",
         (
