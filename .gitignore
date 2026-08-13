@@ -17,3 +17,7 @@ screenshots/*
 !screenshots/.gitkeep
 logs/*
 !logs/.gitkeep
+
+# Real, locally-authenticated Chrome profile(s) created by
+# scripts/google_profile_bootstrap.py -- never something to version control.
+.growthradar/

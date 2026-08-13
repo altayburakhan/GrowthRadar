@@ -1,3 +1,4 @@
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -200,6 +201,12 @@ def test_google_profile_dir_reuses_a_persistent_session_across_runs(
                     "name": "growthradar_test_session",
                     "value": "persisted",
                     "url": "https://accounts.google.com",
+                    # A real signed-in-session cookie is persistent, not
+                    # session-only -- without an explicit expiry, Playwright
+                    # defaults to a session cookie, which browsers correctly
+                    # discard on restart by design (not a persistence bug,
+                    # just the wrong kind of cookie for this test).
+                    "expires": time.time() + 3600,
                 }
             ]
         )
