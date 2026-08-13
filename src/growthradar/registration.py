@@ -167,15 +167,25 @@ def _claim(locator: Locator) -> None:
 
 
 def _visible_unclaimed(locator: Locator) -> Locator | None:
+    """First visible, unclaimed match -- scans every match, not just the
+    first, since a later step's hidden field (still `display:none` until its
+    step is reached) can share the same selector/label and sort earlier in
+    DOM order than the field actually on screen right now (seen live on
+    huddleup.ai's onboarding: a hidden "email" input for step 2 precedes the
+    visible step-1 email input in the DOM, so stopping at `.first` found
+    nothing and the visible field was never filled)."""
     try:
-        if locator.count() == 0:
-            return None
-        first = locator.first
-        if not first.is_visible() or _is_claimed(first):
-            return None
-        return first
+        count = locator.count()
     except PlaywrightError:
         return None
+    for i in range(count):
+        candidate = locator.nth(i)
+        try:
+            if candidate.is_visible() and not _is_claimed(candidate):
+                return candidate
+        except PlaywrightError:
+            continue
+    return None
 
 
 def _find_field(
@@ -239,6 +249,15 @@ def _set_field_value(locator: Locator, value: str) -> bool:
         return _select_option_best_effort(locator, value)
     try:
         locator.fill(value, timeout=2000)
+        # `.fill()` sets the value and fires input/change but never a real
+        # keystroke -- some sites gate submit-button enablement on
+        # `onkeyup` specifically (seen live on huddleup.ai: the field fills
+        # fine, but the submit button stays disabled forever without this,
+        # since its enable handler only runs on keyup). A synthetic keyup
+        # with no key data is enough wherever the handler just re-reads the
+        # input's current value, which covers this pattern generally.
+        with suppress(PlaywrightError):
+            locator.dispatch_event("keyup")
         return True
     except PlaywrightError:
         return False

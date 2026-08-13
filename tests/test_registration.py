@@ -86,6 +86,32 @@ _FORM_WITH_INSERTED_WORD_BUTTON = """
 </body></html>
 """
 
+# Regression (huddleup.ai): a hidden email input belonging to a later wizard
+# step sorts before the real, visible step-1 email input in the DOM and
+# shares the same type/placeholder keyword -- _visible_unclaimed must keep
+# scanning past it instead of giving up at the first (invisible) match.
+_FORM_WITH_HIDDEN_DECOY_EMAIL_FIELD = """
+<html><body>
+<input type="email" id="decoy" style="display:none" placeholder="Enter your work email" />
+<input type="email" id="real" placeholder="Email" />
+<input name="password" type="password" placeholder="Password" />
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+# Regression (huddleup.ai): the submit button starts disabled and is only
+# re-enabled by the email field's own onkeyup handler -- .fill() sets the
+# value and fires input/change but never a real keystroke, so without a
+# synthetic keyup afterward the button stays disabled forever.
+_FORM_WITH_SUBMIT_GATED_BY_EMAIL_KEYUP = """
+<html><body>
+<input name="email" type="email" placeholder="Email"
+  onkeyup="document.getElementById('go').disabled = this.value.length === 0;" />
+<input name="password" type="password" placeholder="Password" />
+<button id="go" disabled onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
 _FORM_WITH_CONSENT_CHECKBOXES = """
 <html><body>
 <input name="email" type="email" placeholder="Email" />
@@ -171,6 +197,31 @@ def test_generated_identity_used_when_none_provided(tmp_path: Path, page: Page) 
 
     assert "@" in result.identity.email
     assert result.identity.password
+    store.close()
+
+
+def test_fills_visible_email_field_past_a_hidden_decoy_earlier_in_the_dom(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_FORM_WITH_HIDDEN_DECOY_EMAIL_FIELD)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    assert page.eval_on_selector("#real", "el => el.value") == result.identity.email
+    store.close()
+
+
+def test_dispatches_keyup_after_fill_so_a_keyup_gated_submit_button_enables(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_FORM_WITH_SUBMIT_GATED_BY_EMAIL_KEYUP)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
     store.close()
 
 
