@@ -124,6 +124,27 @@ def test_dismiss_overlays_clicks_button_inside_a_shadow_root(config: Config) -> 
         )
 
 
+def test_dismiss_overlays_does_not_click_an_unrelated_link_containing_agree(
+    config: Config,
+) -> None:
+    # Regression (onlypult.com): a plain-string has_text="Agree" filter is a
+    # substring match, so it also matched an unrelated "License Agreement"
+    # link sitting right under the signup form's own submit button --
+    # dismiss_overlays (called every registration loop iteration) clicked it
+    # repeatedly, each click opening a new tab and abandoning the actual,
+    # still-unsubmitted form.
+    with BrowserSession(config) as session:
+        page = session.start()
+        page.set_content(
+            "<html><body>"
+            "<a href='https://example.test/license_agreement' target='_blank'>"
+            "License Agreement</a>"
+            "</body></html>"
+        )
+        assert dismiss_overlays(page, timeout=0.3) is False
+        assert len(page.context.pages) == 1
+
+
 def test_retry_reraises_after_exhausting_attempts() -> None:
     calls = {"n": 0}
 

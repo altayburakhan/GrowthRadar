@@ -655,6 +655,20 @@ _CHOICE_EXCLUDE_KEYWORDS: tuple[str, ...] = (
     "help",
     "home",
     "menu",
+    # Legal-document links sitting right next to a signup form's own submit
+    # button (seen live on onlypult.com: "By clicking Sign up you agree to
+    # the Terms of Use, Privacy Policy, License Agreement" inline under the
+    # form, not inside a <footer>, so the nav/footer exclusion in
+    # _CHOICE_CLICKABLE_SELECTOR below doesn't catch them) were an otherwise
+    # unexcluded, always-present "plausible option" -- once the real submit
+    # button got claimed after one attempt, later iterations kept finding
+    # and clicking these instead, each opening a new tab (see
+    # _switch_to_new_page) and abandoning the actual, still-unsubmitted
+    # form.
+    "terms",
+    "privacy policy",
+    "license agreement",
+    "cookie policy",
     *_LOGIN_KEYWORDS,
     *_SIGNUP_KEYWORDS,
 )
@@ -663,7 +677,25 @@ _CHOICE_EXCLUDE_KEYWORDS: tuple[str, ...] = (
 # alternatives -- `f"{_CLICKABLE_SELECTOR}:not(...)"` would silently attach
 # :not() to only the last alternative ([role="button"]), leaving plain
 # <button>/<a> elements inside <nav> unfiltered.
-_CHOICE_CLICKABLE_SELECTOR = f":is({_CLICKABLE_SELECTOR}):not(nav *, header *, footer *)"
+#
+# The `[class*="language" i]`/`[class*="locale" i]` clauses exclude
+# language-switcher widgets and the locale options they reveal (seen live on
+# onlypult.com: <button class="... languages-popover-link"> inside
+# <div class="language-picker">, sitting in the page body outside nav/header/
+# footer). These aren't excludable by keyword, since the toggle's own visible
+# text is just the current locale's name ("English") -- a value keyword-matching
+# can't anticipate. Left unexcluded, the choice-picker fallback clicked this
+# toggle (the first unclaimed candidate in DOM order), which opened a popover
+# of other locale names; the next iteration then clicked one of *those*
+# ("Deutsch"), switching the entire page to German and derailing registration
+# instead of re-submitting the still-unsubmitted form.
+_CHOICE_CLICKABLE_SELECTOR = (
+    f":is({_CLICKABLE_SELECTOR}):not("
+    "nav *, header *, footer *, "
+    '[class*="language" i], [class*="language" i] *, '
+    '[class*="locale" i], [class*="locale" i] *'
+    ")"
+)
 
 
 def _is_submit_like(text: str) -> bool:

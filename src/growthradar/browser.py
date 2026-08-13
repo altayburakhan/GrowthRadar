@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -94,7 +95,16 @@ def dismiss_overlays(page: Page, timeout: float = 1.2) -> bool:
     timeout_ms = timeout * 1000
     for text in _OVERLAY_BUTTON_TEXTS:
         try:
-            locator = page.locator('button, a, [role="button"]').filter(has_text=text)
+            # A plain string `has_text=text` is a substring match, which
+            # over-matches: "Agree" also matches an unrelated "License
+            # Agreement" link (seen live on onlypult.com, where this repeatedly
+            # "dismissed" a registration form's own inline legal link every
+            # loop iteration, each click opening a new tab and abandoning the
+            # actual, still-unsubmitted form). Anchoring to the element's whole
+            # text requires an exact match instead, so only a real standalone
+            # "Agree"-labeled button qualifies.
+            pattern = re.compile(rf"^\s*{re.escape(text)}\s*$", re.IGNORECASE)
+            locator = page.locator('button, a, [role="button"]').filter(has_text=pattern)
             if locator.count() == 0:
                 continue
             locator.first.click(timeout=timeout_ms)
