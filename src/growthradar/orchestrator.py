@@ -39,8 +39,11 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+from playwright.sync_api import Error as PlaywrightError
 
 from growthradar.browser import BrowserSession
 from growthradar.config import Config
@@ -394,6 +397,24 @@ def _temp_email_provider_from_config(config: Config) -> TempEmailProvider | None
     return None
 
 
+def _sync_session_to_newest_page(session: BrowserSession) -> None:
+    """If a click opened a new tab/window (a signup CTA with target="_blank"
+    -- seen live on kamiapp.com's "Try for free"/"Create a free account"
+    buttons, which open the actual app at a different domain), track that
+    new tab as the session's active page instead of the stale original.
+    Without this, run_registration's own internal page-switching (see
+    registration.py's _switch_to_new_page) never reaches the caller, so a
+    later phase (post-registration exploration) would keep exploring the
+    abandoned original tab instead of the one registration actually
+    completed on."""
+    if session.page is None:
+        return
+    with suppress(PlaywrightError):
+        pages = session.page.context.pages
+        if pages and pages[-1] is not session.page:
+            session.page = pages[-1]
+
+
 def _attempt_registration(
     session: BrowserSession,
     store: EvidenceStore,
@@ -425,11 +446,12 @@ def _attempt_registration(
         if not open_registration_entry_point(session.page, run_logger):
             run_logger.action("registration_skipped", reason="no registration page discovered")
             return None
+        _sync_session_to_newest_page(session)
 
     page = session.page
     if page is None:
         return None
-    return run_registration(
+    result = run_registration(
         page,
         store,
         run_logger,
@@ -441,3 +463,9 @@ def _attempt_registration(
         config=config,
         temp_email_provider=_temp_email_provider_from_config(config),
     )
+    # run_registration may have followed a new tab internally (see
+    # registration.py's _switch_to_new_page) -- that only rebinds its own
+    # local page variable, so the session must be re-synced here for
+    # post-registration exploration to pick up the right tab.
+    _sync_session_to_newest_page(session)
+    return result

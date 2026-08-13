@@ -1172,6 +1172,32 @@ def _click_across_frames(page: Page, fn: Callable[[Frame], bool]) -> bool:
     return False
 
 
+def _switch_to_new_page(page: Page, pages_before: int) -> Page:
+    """If the last click opened a new tab/window (page.context.pages grew),
+    continue on the newest one instead of the stale original.
+
+    A signup CTA opening target="_blank" (seen live on kamiapp.com's "Try
+    for free"/"Create a free account" buttons, which open the actual app at
+    a different domain in a new tab) otherwise leaves the loop clicking
+    around whatever's left on the original page -- nav/footer links, in one
+    observed run wandering as far as a help-center "Training Hub" page --
+    for the rest of its step budget, having already wrongly recorded the
+    click as a successful submission.
+    """
+    try:
+        pages = page.context.pages
+    except PlaywrightError:
+        return page
+    if len(pages) <= pages_before:
+        return page
+    new_page = pages[-1]
+    with suppress(PlaywrightError):
+        new_page.bring_to_front()
+    with suppress(PlaywrightError):
+        new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+    return new_page
+
+
 def run_registration(
     page: Page,
     store: EvidenceStore,
@@ -1267,6 +1293,7 @@ def _run_registration(
     verification_code_entered = False
     for _ in range(max_steps):
         dismiss_overlays(page)
+        pages_before = len(page.context.pages)
 
         if _captcha_challenge_visible(page):
             # Nothing safe left to do: we don't solve CAPTCHAs, and letting
@@ -1295,6 +1322,7 @@ def _run_registration(
             # next (an account chooser, a consent screen) is just more pages
             # for this same loop to keep handling on a later iteration.
             steps_completed += 1
+            page = _switch_to_new_page(page, pages_before)
             wait_for_stable(page)
             submitted = True
             continue
@@ -1327,6 +1355,7 @@ def _run_registration(
                     ),
                 )
                 steps_completed += 1
+                page = _switch_to_new_page(page, pages_before)
                 wait_for_stable(page)
                 if clicked:
                     submitted = True
@@ -1371,6 +1400,7 @@ def _run_registration(
                 ),
             )
         )
+        page = _switch_to_new_page(page, pages_before)
 
         if not made_progress and not clicked:
             # Nothing found anywhere yet -- could be genuinely stuck, or

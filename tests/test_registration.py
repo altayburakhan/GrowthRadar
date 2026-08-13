@@ -225,6 +225,47 @@ def test_completes_multi_step_form(tmp_path: Path, page: Page) -> None:
     store.close()
 
 
+# Regression (kamiapp.com): "Create a free account" (word-subset-matches
+# _click_submit's "Create account" target, same as the real button) opens
+# the actual app in a new tab (target="_blank") rather than navigating the
+# current page. Without following it, the loop just kept clicking around
+# whatever was left on the original page for the rest of its step budget --
+# in one observed run, wandering as far as a help-center "Training Hub"
+# page -- while wrongly recording the original click as a submission.
+def test_follows_a_signup_cta_that_opens_a_new_tab(tmp_path: Path, page: Page) -> None:
+    # A real http(s) URL via context.route(), not a data: URL -- modern
+    # Chrome silently refuses to open a data: URL as a new top-level tab
+    # (target="_blank"), which would make this test pass for the wrong
+    # reason (no new tab ever opens, so there'd be nothing to fail to
+    # follow).
+    def handler(route):  # type: ignore[no-untyped-def]  # noqa: ANN001
+        route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=(
+                "<html><body>"
+                '<input name="email" type="email" placeholder="Email" />'
+                '<input name="password" type="password" placeholder="Password" />'
+                "<button onclick=\"document.title='submitted';\">Sign up</button>"
+                "</body></html>"
+            ),
+        )
+
+    page.context.route("https://fake.growthradar.test/app", handler)
+    page.set_content(
+        '<html><body><a href="https://fake.growthradar.test/app" '
+        'target="_blank">Create a free account</a></body></html>'
+    )
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    new_tab = page.context.pages[-1]
+    assert new_tab.title() == "submitted"
+    store.close()
+
+
 def test_stops_when_no_fields_or_buttons_remain(tmp_path: Path, page: Page) -> None:
     page.set_content("<html><body><p>Nothing to fill here</p></body></html>")
     store, run_logger = _store_and_logger(tmp_path)
