@@ -1493,9 +1493,22 @@ def _run_registration(
         # before those fields are filled on the next iteration; that would
         # submit an empty form and trigger the exact validation errors this
         # project exists to avoid.
+        #
+        # `picked` needs the same guard: _click_unclaimed_choice_option
+        # already clicked *something* (the first unexcluded candidate in DOM
+        # order) this iteration -- seen live on kamiapp.com's "try for free"
+        # page, offering 4 product cards with no submit-phrase match on the
+        # first one ("Start for free"): the choice-picker clicked it,
+        # opening a new tab, but _click_submit then ran anyway on the same
+        # (now-stale) `page` reference and found a *different* card's button
+        # ("Create a free account", which does match "Create account"),
+        # clicking that too and opening a second, unrelated new tab. Only
+        # the second click's tab ever got followed, wandering off to
+        # whichever product that button happened to launch instead of the
+        # one the choice-picker actually meant to pick.
         clicked = (
             False
-            if (clicked_email or skipped_prompt)
+            if (clicked_email or skipped_prompt or picked)
             else _click_across_frames(
                 page,
                 partial(

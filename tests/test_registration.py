@@ -1214,6 +1214,36 @@ def test_choice_picker_skips_nav_links_and_back_contact_buttons(tmp_path: Path, 
     store.close()
 
 
+# Regression (kamiapp.com's "Try for free" page): several product cards,
+# each its own link -- the choice-picker's first unclaimed candidate
+# ("Start for free") doesn't match any _SUBMIT_BUTTON_TEXTS phrase, but a
+# *different* card further down ("Create a free account") does. Without a
+# same-iteration guard, _click_submit ran right after the choice-picker on
+# the same stale `page` reference and clicked that second, unrelated card
+# too -- two different navigations from one iteration, only the second
+# ever actually followed.
+_MULTI_CARD_PAGE_WITH_AMBIGUOUS_SUBMIT_MATCH = """
+<html><body>
+<a onclick="document.title='card-a-clicked';return false;">Start for free</a>
+<a onclick="document.title='card-b-clicked';return false;">Create a free account</a>
+</body></html>
+"""
+
+
+def test_choice_picker_click_is_not_followed_by_a_same_iteration_submit_click(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_MULTI_CARD_PAGE_WITH_AMBIGUOUS_SUBMIT_MATCH)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    run_registration(page, store, run_logger, max_steps=1)
+
+    # Whichever card the choice-picker reaches first, only one click should
+    # have happened this iteration -- never both.
+    assert page.title() in ("card-a-clicked", "card-b-clicked")
+    store.close()
+
+
 # Mirrors ansarada.com's real failure mode before this fix: the wizard's
 # "Next" button is a single DOM node reused across steps (disabled until a
 # choice is picked, then re-purposed as the step-2 submit once fields are
