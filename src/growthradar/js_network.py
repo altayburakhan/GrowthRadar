@@ -29,8 +29,8 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Page
 
 from growthradar.browser import RequestRecord
 from growthradar.evidence import Evidence, EvidenceStore
@@ -221,7 +221,13 @@ def _script_urls(page: Page) -> list[str]:
 
 def _check_globals(page: Page, global_names: list[str]) -> set[str]:
     try:
-        found: list[str] = page.evaluate(_GLOBALS_CHECK_JS, global_names)
+        # patchright's evaluate() defaults to an isolated execution context
+        # (a separate `window` from the page's own scripts, done to avoid
+        # detection via Runtime.enable) -- a tool's own `window.<Name> = ...`
+        # assignment is invisible there, so every global check came back
+        # empty. isolated_context=False runs this in the page's real main
+        # world instead, where those assignments actually land.
+        found: list[str] = page.evaluate(_GLOBALS_CHECK_JS, global_names, isolated_context=False)
         return set(found)
     except PlaywrightError as exc:
         logger.warning("global variable inspection failed on %s: %s", page.url, exc)

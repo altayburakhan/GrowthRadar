@@ -8,7 +8,7 @@ install:
 
 install-dev: install
 	.venv/bin/pip install -r requirements-dev.txt
-	.venv/bin/playwright install chromium
+	.venv/bin/patchright install chromium
 
 lint:
 	.venv/bin/ruff check src tests

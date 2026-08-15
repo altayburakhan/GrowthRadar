@@ -149,10 +149,17 @@ def generate_company_name() -> str:
 
 
 def generate_phone() -> str:
-    """A plausible-looking, never-real US phone number (see _PHONE_AREA_CODES)."""
+    """A plausible-looking, never-real US phone number (see _PHONE_AREA_CODES).
+
+    No "+1" country code prefix -- a signup form's own client-side validator
+    commonly strips non-digit characters and checks for exactly 10 digits
+    (seen live on shippingeasy.com: "Please enter a 10 digit US phone
+    number"), and a leading "+1" pushes the stripped digit count to 11,
+    failing that check on every single run.
+    """
     area = random.choice(_PHONE_AREA_CODES)
     subscriber = random.randint(100, 199)
-    return f"+1-{area}-555-0{subscriber}"
+    return f"{area}-555-0{subscriber}"
 
 
 def generate_website(company_name: str) -> str:

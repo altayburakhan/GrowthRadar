@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -52,11 +53,24 @@ _SIGNUP_KEYWORDS: tuple[str, ...] = (
     "register",
 )
 
-# Priority sections from Linear.md's "Exploration Behavior" and "Exploration Strategy".
+# A second-highest tier, above the generic PRIORITY_KEYWORDS bucket below:
+# reliably reachable within a tight page budget (user-requested priority
+# order is signup > post-registration onboarding > landing > product
+# updates), which a flat tier shared with a dozen other keywords (blog,
+# docs, footer, ...) couldn't guarantee.
+_PRODUCT_UPDATES_KEYWORDS: tuple[str, ...] = (
+    "product updates",
+    "release notes",
+    "changelog",
+)
+
+# Priority sections from Linear.md's "Exploration Behavior" and "Exploration
+# Strategy" -- with one deliberate deviation: "Log in"/"Login"/"Sign in" is
+# excluded (falls to the lowest, unprioritized tier) since a separate login
+# visit is redundant once registration succeeds -- that already lands on the
+# onboarding experience directly (see orchestrator.py's post-registration
+# crawl), which is what a login page would otherwise be a detour toward.
 PRIORITY_KEYWORDS: tuple[str, ...] = (
-    "log in",
-    "login",
-    "sign in",
     "dashboard",
     "settings",
     "navigation",
@@ -66,9 +80,6 @@ PRIORITY_KEYWORDS: tuple[str, ...] = (
     "documentation",
     "docs",
     "resource center",
-    "product updates",
-    "release notes",
-    "changelog",
     "blog",
     "analytics",
     "reports",
@@ -215,7 +226,12 @@ class ExplorationEngine:
         )
 
     def run(
-        self, start_url: str, *, initial_kind: ScreenshotKind | None = None
+        self,
+        start_url: str,
+        *,
+        initial_kind: ScreenshotKind | None = None,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ExplorationResult:
         """`initial_kind` overrides `_screenshot_kind_for`'s depth==0 -> LANDING
         default for `start_url` only. Needed for the orchestrator's
@@ -223,7 +239,19 @@ class ExplorationEngine:
         just landed on (e.g. bettermode.com's "Verify your email" step) --
         genuinely the onboarding experience, not a second "landing page" --
         but `_screenshot_kind_for` has no way to know this crawl didn't begin
-        at the site's actual entry point."""
+        at the site's actual entry point.
+
+        `deadline` is a `time.monotonic()` timestamp (see Config.session_deadline_seconds)
+        shared across this whole site's exploration + registration +
+        post-registration exploration -- checked alongside max_pages so a
+        slow-but-not-failing site can't pad out its page budget's worth of
+        wall-clock time several times over across phases.
+
+        `cancelled` is polled the same way -- a callable rather than a plain
+        flag so a caller (the dashboard's Stop button, see web.py) can signal
+        cancellation from another thread mid-run via a `threading.Event`
+        without this engine needing to know anything about threads itself.
+        """
         visited_pages: list[VisitedPage] = []
         frontier: list[DiscoveredLink] = [
             DiscoveredLink(url=start_url, text="start", priority=1.0, depth=0)
@@ -231,7 +259,12 @@ class ExplorationEngine:
         self._enqueued.add(_normalize_url(start_url))
         self._initial_kind = initial_kind
 
-        while frontier and len(visited_pages) < self.max_pages:
+        while (
+            frontier
+            and len(visited_pages) < self.max_pages
+            and (deadline is None or time.monotonic() < deadline)
+            and not (cancelled is not None and cancelled())
+        ):
             frontier.sort(key=lambda link: (link.depth, -link.priority))
             link = frontier.pop(0)
 
@@ -262,9 +295,14 @@ class ExplorationEngine:
             if self.crawl_delay:
                 time.sleep(self.crawl_delay)
 
-        stopped_reason = (
-            "max_pages_reached" if len(visited_pages) >= self.max_pages else "frontier_exhausted"
-        )
+        if len(visited_pages) >= self.max_pages:
+            stopped_reason = "max_pages_reached"
+        elif cancelled is not None and cancelled():
+            stopped_reason = "cancelled"
+        elif deadline is not None and time.monotonic() >= deadline:
+            stopped_reason = "deadline_exceeded"
+        else:
+            stopped_reason = "frontier_exhausted"
         self.run_logger.decision(
             f"exploration finished: {len(visited_pages)} page(s) visited ({stopped_reason})",
             evidence_refs=[vp.url for vp in visited_pages if vp.success],
@@ -412,6 +450,8 @@ def _priority_score(text: str, url: str) -> float:
     haystack = f"{text} {url}".lower().replace("-", " ").replace("_", " ")
     if any(keyword in haystack for keyword in _SIGNUP_KEYWORDS):
         return 2.0
+    if any(keyword in haystack for keyword in _PRODUCT_UPDATES_KEYWORDS):
+        return 1.5
     return 1.0 if any(keyword in haystack for keyword in PRIORITY_KEYWORDS) else 0.0
 
 

@@ -2,7 +2,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
-from playwright.sync_api import Page
+from patchright.sync_api import Page
 
 from growthradar.browser import BrowserSession
 from growthradar.config import Config
@@ -63,9 +63,18 @@ def _engine(
 
 
 def test_priority_score_matches_target_keywords() -> None:
-    assert _priority_score("Login", "https://x.com/login") == 1.0
     assert _priority_score("Documentation", "https://x.com/docs") == 1.0
     assert _priority_score("Random Thing", "https://x.com/random") == 0.0
+
+
+def test_priority_score_deprioritizes_login() -> None:
+    # A separate login visit is redundant once registration succeeds -- that
+    # already lands on the onboarding experience directly (see
+    # orchestrator.py's post-registration crawl) -- so login must not compete
+    # for a spot in a tight page budget the way other content pages do.
+    assert _priority_score("Login", "https://x.com/login") == 0.0
+    assert _priority_score("Log in", "https://x.com/login") == 0.0
+    assert _priority_score("Sign in", "https://x.com/signin") == 0.0
 
 
 def test_priority_score_ranks_signup_trial_cta_above_generic_content_links() -> None:
@@ -76,6 +85,16 @@ def test_priority_score_ranks_signup_trial_cta_above_generic_content_links() -> 
     assert _priority_score("Sign up", "https://x.com/signup") == 2.0
     assert _priority_score("Login", "https://x.com/login") < 2.0
     assert _priority_score("Blog", "https://x.com/blog") < 2.0
+
+
+def test_priority_score_ranks_product_updates_above_generic_content_links() -> None:
+    # Reliably reachable within a tight page budget even when several
+    # equal-tier content links (blog, docs, footer, ...) are competing for
+    # the same remaining spots.
+    assert _priority_score("Product Updates", "https://x.com/product-updates") == 1.5
+    assert _priority_score("Changelog", "https://x.com/changelog") == 1.5
+    assert _priority_score("Release Notes", "https://x.com/release-notes") == 1.5
+    assert _priority_score("Blog", "https://x.com/blog") < 1.5
 
 
 def test_priority_score_prioritizes_read_more_article_links() -> None:
@@ -208,6 +227,14 @@ def test_breadth_first_order_and_priority_within_level(tmp_path: Path, page: Pag
     result = engine.run(home_url)
 
     urls_in_order = [v.url for v in result.visited]
+    # login_url here embeds dashboard_url's own HTML as its child link (an
+    # artifact of how these tests build a small link graph out of data:
+    # URLs), so its "url" half of the priority haystack literally contains
+    # the word "Dashboard" and still scores 1.0 despite login itself being
+    # deprioritized (see test_priority_score_deprioritizes_login, which uses
+    # plain, non-nested URLs where that leak can't happen). login and docs
+    # stay tied at 1.0 here, so original nav order (login before docs) wins
+    # the tie-break -- this test's actual point either way.
     assert urls_in_order == [home_url, login_url, docs_url, random_url, dashboard_url]
     # docs links back to an already-visited page (login) -- must not be revisited.
     assert urls_in_order.count(login_url) == 1

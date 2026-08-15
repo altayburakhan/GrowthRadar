@@ -3,9 +3,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Page
+from patchright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from growthradar.browser import BrowserSession, dismiss_overlays, retry
 from growthradar.config import Config
@@ -44,6 +44,42 @@ def test_start_is_idempotent(config: Config) -> None:
         assert page1 is page2
     finally:
         session.close()
+
+
+def test_start_failure_after_driver_launch_does_not_leak_the_driver(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: a failure anywhere in _start_after_driver (e.g. a real
+    # launch_persistent_context SingletonLock error, seen live) used to leak
+    # the playwright driver's event loop -- `with BrowserSession(...)` never
+    # calls __exit__/close() when __enter__ (start()) itself raises, so
+    # nothing ever stopped it. On the dashboard, whose ThreadPoolExecutor
+    # reuses worker threads across scans, that leaked, still-"running" event
+    # loop then made every later scan that landed on the same thread fail
+    # immediately with "Please use the Async API instead" -- a completely
+    # unrelated asyncio error on a run that never touched asyncio itself.
+    session = BrowserSession(config)
+    monkeypatch.setattr(
+        session,
+        "_start_after_driver",
+        lambda playwright: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    with pytest.raises(RuntimeError):
+        session.start()
+
+    assert session._playwright is None
+    assert session.page is None
+
+    # The real symptom: a second, unrelated session must still be able to
+    # start cleanly afterward -- it couldn't when the first one's driver was
+    # left running.
+    second = BrowserSession(config)
+    try:
+        second.start()
+        assert second.page is not None
+    finally:
+        second.close()
 
 
 def test_close_is_idempotent(config: Config) -> None:
@@ -106,8 +142,7 @@ def test_dismiss_overlays_clicks_button_inside_a_shadow_root(config: Config) -> 
     with BrowserSession(config) as session:
         page = session.start()
         page.set_content("<html><body><div id='host'></div></body></html>")
-        page.evaluate(
-            """() => {
+        page.evaluate("""() => {
                 const host = document.getElementById('host');
                 const root = host.attachShadow({mode: 'open'});
                 // this.parentElement, not document.getElementById -- the
@@ -116,12 +151,46 @@ def test_dismiss_overlays_clicks_button_inside_a_shadow_root(config: Config) -> 
                 root.innerHTML = `<div id="modal">
                     <button onclick="this.parentElement.remove()">Accept</button>
                 </div>`;
-            }"""
-        )
+            }""")
         assert dismiss_overlays(page, timeout=1.0) is True
         assert page.evaluate(
             "() => !document.getElementById('host').shadowRoot.getElementById('modal')"
         )
+
+
+def test_dismiss_overlays_clicks_an_icon_only_button_via_aria_label(config: Config) -> None:
+    # Regression (mirro.io): a HubSpot marketing popup's close control has
+    # no visible text at all -- just an SVG icon behind
+    # role="button" aria-label="Close" -- so the existing text-only
+    # matching never found it, leaving the popup up and blocking every
+    # click on the page beneath it (including the site's own "Login" link).
+    with BrowserSession(config) as session:
+        page = session.start()
+        page.set_content(
+            "<html><body>"
+            '<div id="popup" role="button" aria-label="Close" '
+            "onclick=\"document.getElementById('popup').remove()\">"
+            "<svg></svg></div>"
+            "</body></html>"
+        )
+        assert dismiss_overlays(page, timeout=1.0) is True
+        assert page.locator("#popup").count() == 0
+
+
+def test_dismiss_overlays_finds_overlay_inside_an_iframe(config: Config) -> None:
+    # Regression (mirro.io): the popup's actual content, including its
+    # close button, rendered inside a same-origin-restricted iframe served
+    # from a third-party (HubSpot) domain -- a plain page.locator() never
+    # searches inside an iframe's document at all, so the popup was
+    # permanently undismissable no matter what button-matching it used.
+    with BrowserSession(config) as session:
+        page = session.start()
+        inner_html = '<button onclick="this.remove()">Got it</button>'
+        page.set_content(f"<html><body><iframe srcdoc='{inner_html}'></iframe></body></html>")
+        page.wait_for_timeout(300)
+        assert dismiss_overlays(page, timeout=1.0) is True
+        frame = next(f for f in page.frames if f.url == "about:srcdoc")
+        assert frame.locator("button").count() == 0
 
 
 def test_dismiss_overlays_does_not_click_an_unrelated_link_containing_agree(

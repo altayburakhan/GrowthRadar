@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page
+from patchright.sync_api import Page
 
 from growthradar.browser import BrowserSession
 from growthradar.config import Config

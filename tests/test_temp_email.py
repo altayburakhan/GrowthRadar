@@ -155,6 +155,27 @@ def test_extract_verification_code_returns_none_when_no_digits_present() -> None
     assert _extract_verification_code("Thanks for signing up, no code here") is None
 
 
+def test_extract_verification_code_ignores_inline_style_hex_color_near_code() -> None:
+    # Regression (sproutsocial.com): a design-heavy HTML-only transactional
+    # email (no text/plain alternative) with an inline style="color:#040404"
+    # sitting right next to the word "code" -- the raw, un-stripped HTML
+    # read "040404" as the OTP instead of the real one further away, and the
+    # site rejected it as incorrect.
+    body = (
+        '<div style="color:#040404">Verify your email</div>'
+        "<p>Enter this code to continue: <b>918273</b></p>"
+    )
+    assert _extract_verification_code(body) == "918273"
+
+
+def test_extract_verification_code_ignores_style_block_contents() -> None:
+    body = (
+        "<style>.code-box{color:#040404;font-size:14px}</style>"
+        "<p>Your verification code is 918273.</p>"
+    )
+    assert _extract_verification_code(body) == "918273"
+
+
 class _FakeImapConnection:
     def __init__(self, messages: dict[bytes, bytes]) -> None:
         self._messages = messages

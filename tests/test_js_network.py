@@ -1,8 +1,8 @@
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Page
 
 from growthradar.browser import BrowserSession, RequestRecord
 from growthradar.config import Config
@@ -174,7 +174,7 @@ def test_collect_and_record_serializes_category(tmp_path: Path, page: Page) -> N
 class _FailingPage:
     url = "https://broken.example.com"
 
-    def evaluate(self, script: str, *args: object) -> None:
+    def evaluate(self, script: str, *args: object, **kwargs: object) -> None:
         raise PlaywrightError("evaluation context destroyed")
 
 

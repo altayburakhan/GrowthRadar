@@ -85,6 +85,29 @@ def test_email_verification_required_defaults_false_without_the_signal(config: C
     assert report.email_verification_required is False
 
 
+def test_flags_phone_verification_required_from_registration_evidence(config: Config) -> None:
+    evidence = [
+        _evidence(
+            "registration attempt",
+            visible_ui={"submitted": False, "phone_verification_required": True},
+        ),
+    ]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.phone_verification_required is True
+
+
+def test_phone_verification_required_defaults_false_without_the_signal(config: Config) -> None:
+    evidence = [_evidence("registration attempt", visible_ui={"submitted": True})]
+    score = score_run("run-1", evidence, config)
+
+    report = generate_report("run-1", evidence, score)
+
+    assert report.phone_verification_required is False
+
+
 def test_company_name_falls_back_to_domain(config: Config) -> None:
     evidence = [
         _evidence(

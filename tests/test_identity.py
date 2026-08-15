@@ -76,10 +76,13 @@ def test_generate_identity_has_a_date_of_birth() -> None:
 
 
 def test_generate_phone_matches_reserved_fictional_block() -> None:
-    # +1-<area>-555-01XX -- the block North American telecom permanently
-    # reserves as never assigned to a real subscriber.
+    # <area>-555-01XX -- the block North American telecom permanently
+    # reserves as never assigned to a real subscriber. No "+1" country-code
+    # prefix -- see generate_phone's docstring for why.
     for _ in range(20):
-        assert re.fullmatch(r"\+1-\d{3}-555-01\d{2}", generate_phone())
+        phone = generate_phone()
+        assert re.fullmatch(r"\d{3}-555-01\d{2}", phone)
+        assert sum(c.isdigit() for c in phone) == 10
 
 
 def test_generate_website_builds_url_from_company_name() -> None:
@@ -94,7 +97,7 @@ def test_generate_website_falls_back_when_company_name_has_no_alnum_chars() -> N
 
 def test_generate_identity_has_phone_and_website() -> None:
     identity = generate_identity(company_name="Acme Analytics")
-    assert identity.phone.startswith("+1-")
+    assert sum(c.isdigit() for c in identity.phone) == 10
     assert identity.website == "https://acmeanalytics.example.com"
 
 

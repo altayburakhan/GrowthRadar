@@ -29,6 +29,11 @@ class Config:
     max_pages: int
     crawl_delay: float
     user_agent: str
+    # Wall-clock ceiling for one whole site (exploration + registration +
+    # onboarding exploration combined), not just one phase -- per-action
+    # timeouts alone don't bound total run time when a slow-but-not-quite-
+    # failing site pads out several phases in a row.
+    session_deadline_seconds: float
 
     db_path: str
     log_level: str
@@ -76,6 +81,8 @@ class Config:
             raise ConfigError("GROWTHRADAR_REQUEST_TIMEOUT must be > 0")
         if self.max_pages <= 0:
             raise ConfigError("GROWTHRADAR_MAX_PAGES must be > 0")
+        if self.session_deadline_seconds <= 0:
+            raise ConfigError("GROWTHRADAR_SESSION_DEADLINE_SECONDS must be > 0")
         if self.crawl_delay < 0:
             raise ConfigError("GROWTHRADAR_CRAWL_DELAY must be >= 0")
         if self.allow_google_oauth and not self.google_profile_dir:
@@ -134,8 +141,9 @@ class Config:
                 groq_vision_model=_get_optional("GROQ_VISION_MODEL"),
                 llm_provider=_get("GROWTHRADAR_LLM_PROVIDER", "auto"),  # type: ignore[arg-type]
                 request_timeout=float(_get("GROWTHRADAR_REQUEST_TIMEOUT", "10")),
-                max_pages=int(_get("GROWTHRADAR_MAX_PAGES", "8")),
+                max_pages=int(_get("GROWTHRADAR_MAX_PAGES", "5")),
                 crawl_delay=float(_get("GROWTHRADAR_CRAWL_DELAY", "0.5")),
+                session_deadline_seconds=float(_get("GROWTHRADAR_SESSION_DEADLINE_SECONDS", "160")),
                 user_agent=_get("GROWTHRADAR_USER_AGENT", "GrowthRadarBot/0.1"),
                 db_path=_get("GROWTHRADAR_DB_PATH", "growthradar.db"),
                 log_level=_get("GROWTHRADAR_LOG_LEVEL", "INFO").upper(),

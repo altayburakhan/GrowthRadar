@@ -73,6 +73,7 @@ class FinalReport:
     competitor_tool_evidence: tuple[ToolSighting, ...] = ()
     already_userguiding_customer: bool = False
     email_verification_required: bool = False
+    phone_verification_required: bool = False
 
 
 def _by_label_prefix(evidence: list[Evidence], *prefixes: str) -> list[Evidence]:
@@ -251,6 +252,10 @@ def generate_report(
         isinstance(e.visible_ui, dict) and e.visible_ui.get("email_verification_required") is True
         for e in registration_attempts
     )
+    phone_verification_required = any(
+        isinstance(e.visible_ui, dict) and e.visible_ui.get("phone_verification_required") is True
+        for e in registration_attempts
+    )
     onboarding_detected = any(
         (e.confidence or 0) >= _CONFIDENT_THRESHOLD for e in onboarding_evidence
     )
@@ -273,6 +278,7 @@ def generate_report(
         explored_pages=_unique_urls(dom_pages),
         registration_completed=registration_completed,
         email_verification_required=email_verification_required,
+        phone_verification_required=phone_verification_required,
         trial_available=_trial_available(evidence),
         onboarding_detected=onboarding_detected,
         evidence_collected=len(evidence),
@@ -344,6 +350,8 @@ def to_markdown(report: FinalReport) -> str:
         f"- **Registration completed**: {'Yes' if report.registration_completed else 'No'}",
         "- **Email verification required**: "
         f"{'Yes' if report.email_verification_required else 'No'}",
+        "- **Phone verification required**: "
+        f"{'Yes' if report.phone_verification_required else 'No'}",
         f"- **Trial available**: {'Yes' if report.trial_available else 'No'}",
         f"- **Onboarding detected**: {'Yes' if report.onboarding_detected else 'No'}",
         f"- **Evidence collected**: {report.evidence_collected}",

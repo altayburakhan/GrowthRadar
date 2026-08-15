@@ -10,8 +10,8 @@ import logging
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Page
 
 from growthradar.evidence import Evidence, EvidenceStore
 

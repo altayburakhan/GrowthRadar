@@ -9,6 +9,7 @@ from growthradar.config import Config
 from growthradar.evidence import EvidenceStore
 from growthradar.history import RunHistoryStore
 from growthradar.orchestrator import (
+    _find_registration_page_url,
     _normalize_target_url,
     run_growthradar_batch,
     run_growthradar_session,
@@ -367,6 +368,62 @@ def test_registration_falls_back_to_modal_entry_point_when_no_distinct_url_found
     assert outcome.registration.submitted is True
     assert outcome.report.registration_completed is True
     assert outcome.errors == ()
+
+
+def test_find_registration_page_url_prefers_the_actual_signup_form_over_a_pricing_page(
+    config: Config,
+) -> None:
+    # Regression (statusbrew.com): a "Free Trial" nav link classified
+    # /pricing as "registration" -- a plan-comparison page with no form on
+    # it at all -- while the real signup form (space.statusbrew.com/
+    # get-started, titled "Sign up | Statusbrew") was visited moments later
+    # and, before this fix, was never picked because the first match always
+    # won. The fix must prefer whichever candidate's own URL+title most
+    # directly names the signup flow, regardless of visit order.
+    with EvidenceStore(db_path=config.db_path) as store:
+        store.add(
+            "run-1",
+            "screenshot: Statusbrew Pricing - Find Out How Much Statusbrew Costs?",
+            url="https://statusbrew.com/pricing",
+            visible_ui={"screenshot_kind": "registration", "success": True},
+        )
+        store.add(
+            "run-1",
+            "screenshot: Sign up | Statusbrew",
+            url="https://space.statusbrew.com/get-started",
+            visible_ui={"screenshot_kind": "registration", "success": True},
+        )
+
+        assert (
+            _find_registration_page_url(store, "run-1")
+            == "https://space.statusbrew.com/get-started"
+        )
+
+
+def test_find_registration_page_url_falls_back_to_the_only_candidate(config: Config) -> None:
+    with EvidenceStore(db_path=config.db_path) as store:
+        store.add(
+            "run-1",
+            "screenshot: Sign up",
+            url="https://example.com/signup",
+            visible_ui={"screenshot_kind": "registration", "success": True},
+        )
+
+        assert _find_registration_page_url(store, "run-1") == "https://example.com/signup"
+
+
+def test_find_registration_page_url_returns_none_without_a_registration_candidate(
+    config: Config,
+) -> None:
+    with EvidenceStore(db_path=config.db_path) as store:
+        store.add(
+            "run-1",
+            "screenshot: Home",
+            url="https://example.com",
+            visible_ui={"screenshot_kind": "landing", "success": True},
+        )
+
+        assert _find_registration_page_url(store, "run-1") is None
 
 
 def test_run_id_is_auto_generated_when_not_provided(tmp_path: Path, config: Config) -> None:

@@ -11,19 +11,21 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
+from urllib.parse import urljoin
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Frame, Locator, Page
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Frame, Locator, Page
 
 from growthradar.browser import dismiss_overlays, retry, wait_for_stable
 from growthradar.config import Config
 from growthradar.event_log import RunLogger
 from growthradar.evidence import EvidenceStore
-from growthradar.exploration import _SIGNUP_KEYWORDS
+from growthradar.exploration import _SIGNUP_KEYWORDS, _in_scope
 from growthradar.identity import Identity, generate_identity
 from growthradar.screenshot import ScreenshotKind, capture_and_record
 from growthradar.temp_email import TempEmailProvider, TempInbox
@@ -36,6 +38,15 @@ logger = logging.getLogger(__name__)
 # real field-filling step can each consume one iteration on their own
 # (seen on ansarada.com's signup wizard).
 MAX_FORM_STEPS = 8
+# A step-count budget alone doesn't bound wall-clock time -- each iteration's
+# own actions are individually timeout-bounded, but on a real, heavily
+# anti-bot-instrumented signup page (seen live on squareup.com: the tab's own
+# JS pegged a CPU core, and the browser stopped responding to our commands in
+# any timely way) those per-action timeouts can each still take their full
+# duration back-to-back, and MAX_FORM_STEPS=8 iterations of that adds up to
+# a run that never converges within a sane amount of time. This is the
+# backstop: once elapsed, stop trying no matter which step we're on.
+_MAX_REGISTRATION_SECONDS = 180.0
 _MAX_VISION_ATTEMPTS = 2
 # See the "nothing found anywhere yet" branch in _run_registration's loop --
 # a lazily-loaded embedded form (e.g. HubSpot) can take several seconds
@@ -164,6 +175,7 @@ class RegistrationResult:
     submitted: bool
     verification_link_opened: bool
     email_verification_required: bool = False
+    phone_verification_required: bool = False
     verification_code_entered: bool = False
     error: str | None = None
 
@@ -492,6 +504,18 @@ def _check_consent_checkboxes(frame: Frame) -> int:
     leaving a `pointer-events: none`, `aria-hidden` shadow `<input>` purely
     for form submission -- `.check()` on that shadow input times out, so the
     two need different check-state and click strategies).
+
+    A native `<input>` can still fail to `.check()` even though it's the
+    real control: some component libraries (seen live on statusbrew.com, an
+    Angular Material-style checkbox) render a custom visual indicator
+    directly on top of the native input for styling, which intercepts
+    pointer events at the input's own screen location -- Playwright
+    correctly refuses to click there rather than risk clicking the wrong
+    thing. Falling back to a click on the wrapping `<label>` (which forwards
+    a real click to its input via standard browser behavior, and is present
+    here specifically because that's also where this function's own label
+    text came from) recovers cleanly instead of leaving the box unchecked
+    and the "I agree..." gate permanently blocking submission.
     """
     try:
         boxes = frame.locator('input[type="checkbox"], [role="checkbox"]')
@@ -517,7 +541,26 @@ def _check_consent_checkboxes(frame: Frame) -> int:
 
         try:
             if native:
-                box.check(timeout=2000)
+                try:
+                    box.check(timeout=2000)
+                except PlaywrightError:
+                    wrapping_label = box.locator("xpath=ancestor::label[1]")
+                    if wrapping_label.count() == 0:
+                        raise
+                    wrapping_label.first.click(timeout=2000)
+                    if not box.is_checked():
+                        # The label click landed on a different control
+                        # instead (seen live with the Radix/shadcn shadow-
+                        # input pattern above: the same label also wraps a
+                        # role="checkbox" button, and browsers forward a
+                        # label click to the first labelable descendant --
+                        # the button, not this input -- toggling *its*
+                        # state instead of this shadow input's, which never
+                        # reflects a checked state at all). Nothing useful
+                        # happened to *this* box, so treat it the same as
+                        # any other failed attempt rather than claiming a
+                        # false success.
+                        raise PlaywrightError("label click did not check this box") from None
             else:
                 box.click(timeout=2000)
         except PlaywrightError:
@@ -547,8 +590,7 @@ def _words(text: str) -> set[str]:
 _OAUTH_PHRASE_RE = re.compile(r"\b(with|via)\b")
 
 
-def _is_oauth_button(locator: Locator, *, allow_google: bool = False) -> bool:
-    lowered = _clickable_text(locator).lower()
+def _is_oauth_text(lowered: str, *, allow_google: bool = False) -> bool:
     matched_providers = [keyword for keyword in _OAUTH_BUTTON_KEYWORDS if keyword in lowered]
     if matched_providers:
         # Google-only opt-in (config.allow_google_oauth + a signed-in
@@ -567,6 +609,10 @@ def _is_oauth_button(locator: Locator, *, allow_google: bool = False) -> bool:
     # third-party connector -- same enumeration-avoidance reasoning as
     # _fill_unclaimed_generic_name_fields (GRO-40).
     return bool(_OAUTH_PHRASE_RE.search(lowered)) and "email" not in lowered
+
+
+def _is_oauth_button(locator: Locator, *, allow_google: bool = False) -> bool:
+    return _is_oauth_text(_clickable_text(locator).lower(), allow_google=allow_google)
 
 
 # Reuses exploration.py's _SIGNUP_KEYWORDS (imported above) so "what counts as
@@ -963,6 +1009,43 @@ def _fill_verification_code(page: Page, code: str) -> bool:
     return False
 
 
+def _is_offsite_link(candidate: Locator, page_url: str) -> bool:
+    """True for an `<a href>` pointing off the current site entirely (a
+    different registrable domain, not just a different path/subdomain --
+    see exploration.py's _in_scope, which already treats a same-site
+    subdomain like space.statusbrew.com as in-scope, so a genuine signup
+    flow redirecting to an app subdomain is never excluded by this).
+
+    Seen live on kamiapp.com's "Start free" choice screen (four product
+    cards, no single form): a promotional banner link, "Find answers in the
+    Kami Learning Hub", sits earlier in the DOM than any of the real
+    product CTAs and matches none of _CHOICE_EXCLUDE_KEYWORDS, so the
+    choice-picker clicked it first, landing on an unrelated HubSpot-hosted
+    resource page instead of ever reaching a signup flow.
+    """
+    try:
+        href = candidate.get_attribute("href")
+    except PlaywrightError:
+        return False
+    if not href:
+        return False
+    try:
+        return not _in_scope(page_url, urljoin(page_url, href))
+    except ValueError:
+        return False
+
+
+def _is_signup_flavored(text: str) -> bool:
+    """True if every word of some known signup/trial phrase (_SIGNUP_KEYWORDS)
+    appears in this candidate's own text, in any order/position -- the same
+    forgiving word-subset matching _click_submit uses, needed here for the
+    same reason: real button copy inserts words a fixed phrase list can't
+    anticipate (e.g. kamiapp.com's "Create a free account", which doesn't
+    contain "create account" as a contiguous substring)."""
+    candidate_words = _words(text)
+    return any(_words(keyword) <= candidate_words for keyword in _SIGNUP_KEYWORDS)
+
+
 def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = False) -> bool:
     try:
         candidates = page.locator(_CHOICE_CLICKABLE_SELECTOR)
@@ -970,6 +1053,19 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
     except PlaywrightError:
         return False
 
+    page_url = page.url
+    eligible: list[tuple[Locator, str]] = []
+    # Submit-like AND signup-flavored (e.g. kamiapp.com's "Create a free
+    # account", which matches _SUBMIT_BUTTON_TEXTS' "Create account" via
+    # word-subset) is unambiguously the best possible pick -- always
+    # preferred outright, unlike a merely submit-like button with no
+    # signup wording ("Continue"/"Next"), which is deliberately left alone
+    # here for _click_submit to find on a later iteration instead (see the
+    # `picked` guard below _click_unclaimed_choice_option's call site: this
+    # function and _click_submit never both click within the same
+    # iteration, to avoid clicking two different cards -- seen live on an
+    # earlier kamiapp.com regression).
+    best: list[tuple[Locator, str]] = []
     for i in range(count):
         candidate = candidates.nth(i)
         try:
@@ -981,10 +1077,35 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
         if not text:
             continue
         lowered = text.lower()
-        if _is_oauth_button(candidate, allow_google=allow_google_oauth) or _is_submit_like(lowered):
+        if _is_oauth_button(candidate, allow_google=allow_google_oauth):
             continue
         if any(keyword in lowered for keyword in _CHOICE_EXCLUDE_KEYWORDS):
             continue
+        signup_flavored = _is_signup_flavored(text)
+        # Only applied to non-signup-flavored candidates: a real signup CTA
+        # can itself route through a third-party click-tracking redirect
+        # (seen live on kamiapp.com: "Create a free account"'s href is a
+        # cta-service-cms2.hubspot.com tracking link, not kamiapp.com
+        # itself, yet it's exactly the button we want) -- the offsite check
+        # exists to catch genuinely unrelated content links like the
+        # "Learning Hub" banner, not to second-guess text that already
+        # reads as a clear signup CTA.
+        if not signup_flavored and _is_offsite_link(candidate, page_url):
+            continue
+        if _is_submit_like(lowered):
+            if signup_flavored:
+                best.append((candidate, text))
+            continue
+        eligible.append((candidate, text))
+
+    # Among the rest, a signup/trial-flavored option (seen live on
+    # kamiapp.com: "Book a 30-day trial") still beats whatever happens to
+    # sit first in DOM order (there: a "talk to us" sales-contact link,
+    # which matches no exclusion keyword but isn't a self-serve signup
+    # either). sorted() is stable, so this only reorders when a
+    # signup-flavored option actually exists among `eligible`.
+    ordered = best + sorted(eligible, key=lambda pair: not _is_signup_flavored(pair[1]))
+    for candidate, _text in ordered:
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -1048,6 +1169,41 @@ def _captcha_challenge_visible(page: Page) -> bool:
     return False
 
 
+# A reCAPTCHA challenge can present as just the small, un-solved "I'm not a
+# robot" checkbox -- well under _captcha_challenge_visible's size floor --
+# paired with the site's own error copy telling the visitor to solve it
+# (seen live on paperbell.com: "Sorry, you have triggered a security
+# warning. Please click the box above and try again."). Without this,
+# _captcha_challenge_visible alone missed it and the loop kept re-clicking
+# "Create my account" every remaining iteration, each click re-triggering
+# the same warning and resetting the form, while steps_completed/submitted
+# still reported a normal successful click -- a false-positive "registration
+# completed" for a signup that never actually went through.
+_CAPTCHA_WARNING_PHRASES: tuple[str, ...] = (
+    "triggered a security warning",
+    "verify you are human",
+    "verify you're human",
+    "unusual traffic",
+    "captcha verification failed",
+)
+
+
+def _captcha_warning_visible(page: Page) -> bool:
+    """Same "never conclude from one signal" reasoning as
+    _code_entry_visible: requires the CAPTCHA widget selector to also be
+    present, not the warning phrase alone."""
+    try:
+        text = page.inner_text("body").lower()
+    except PlaywrightError:
+        return False
+    if not any(phrase in text for phrase in _CAPTCHA_WARNING_PHRASES):
+        return False
+    try:
+        return page.locator(_CAPTCHA_SELECTOR).count() > 0
+    except PlaywrightError:
+        return False
+
+
 # "Verify your email"/"Check your email"-style gates block further progress
 # just as completely as a CAPTCHA -- there's no automated way to open a link
 # sitting in a real inbox from here (registration.py's TempEmailProvider path
@@ -1075,6 +1231,36 @@ def _email_verification_required(page: Page) -> bool:
     except PlaywrightError:
         return False
     return any(phrase in body_text for phrase in _EMAIL_VERIFICATION_PHRASES)
+
+
+# A phone/SMS verification gate blocks progress the same way an email one
+# does, but this project has no way to solve it even in principle: unlike
+# email (a real, readable Gmail inbox, see GmailImapProvider), there's no
+# receivable phone number configured anywhere. Flagged as its own distinct
+# evidence/report field (never lumped in with the email flag) purely so the
+# dashboard can call out *which* kind of gate stopped the run, rather than
+# it reading as a generic, unexplained failure -- seen live on
+# shippingeasy.com, reached right after its email-verification link was
+# successfully opened ("Success! Your email is now verified.") -- the two
+# gates can chain, so this is checked independently of the email one, not
+# as an alternative to it.
+_PHONE_VERIFICATION_PHRASES: tuple[str, ...] = (
+    "verify your phone",
+    "verify your phone number",
+    "verify your mobile",
+    "phone verification code",
+    "verification code to your phone",
+    "text message with a verification code",
+    "send you a text",
+)
+
+
+def _phone_verification_required(page: Page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000).lower()
+    except PlaywrightError:
+        return False
+    return any(phrase in body_text for phrase in _PHONE_VERIFICATION_PHRASES)
 
 
 def _click_by_exact_text(page: Page, text: str) -> bool:
@@ -1126,6 +1312,31 @@ def _visible_credential_field_count(page: Page) -> int:
     return visible
 
 
+_FAST_VISIBLE_TEXT_JS = """el => {
+    const style = getComputedStyle(el);
+    const visible = style.visibility !== 'hidden' && style.display !== 'none'
+        && el.getClientRects().length > 0;
+    const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    return [visible, text];
+}"""
+
+
+def _fast_visible_text(candidate: Locator) -> tuple[bool, str]:
+    """One JS round-trip in place of _clickable_text's `.inner_text(timeout=500)`
+    plus a separate `.is_visible()` call -- each of those carries its own
+    Playwright actionability-wait overhead per call, which is fine for a
+    single element but not for scanning every clickable element on a page
+    one at a time (see _find_clickable_by_keywords, the only caller: a
+    link-heavy marketing page -- 188 candidates on mirro.io's landing page
+    -- made one search take well over a minute this way, even when nothing
+    ultimately matched)."""
+    try:
+        visible, text = candidate.evaluate(_FAST_VISIBLE_TEXT_JS)
+        return bool(visible), str(text)
+    except PlaywrightError:
+        return False, ""
+
+
 def _find_clickable_by_keywords(page: Page, keywords: tuple[str, ...]) -> Locator | None:
     # Substring matching (not _click_submit's word-subset matching) --
     # consistent with how exploration.py already matches these same keyword
@@ -1139,15 +1350,13 @@ def _find_clickable_by_keywords(page: Page, keywords: tuple[str, ...]) -> Locato
         return None
     for i in range(count):
         candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible():
-                continue
-        except PlaywrightError:
+        visible, text = _fast_visible_text(candidate)
+        if not visible or not text:
             continue
-        text = _clickable_text(candidate).lower()
-        if not text or _is_oauth_button(candidate):
+        lowered = text.lower()
+        if _is_oauth_text(lowered):
             continue
-        if any(keyword in text for keyword in keywords):
+        if any(keyword in lowered for keyword in keywords):
             return candidate
     return None
 
@@ -1188,11 +1397,26 @@ def open_registration_entry_point(page: Page, run_logger: RunLogger) -> bool:
     with suppress(PlaywrightError):
         page.wait_for_timeout(1500)
 
+    # Proactively clear a delayed popup/consent overlay before it can
+    # intercept the click below (seen live on mirro.io: a HubSpot marketing
+    # popup appears on its own ~2.5s timer after page load and, once up,
+    # blocks every click on the page beneath it -- including this exact
+    # "Login" link. dismiss_overlays was previously only called *after*
+    # this click, too late to help a click that's already failing).
+    dismiss_overlays(page)
+
     fields_before = _visible_credential_field_count(page)
     try:
         trigger.click(timeout=3000)
     except PlaywrightError:
-        return False
+        # The popup runs on its own timer, not ours -- it can still appear
+        # mid-attempt even after the proactive dismiss above. One more
+        # dismiss-and-retry before giving up entirely.
+        dismiss_overlays(page)
+        try:
+            trigger.click(timeout=3000)
+        except PlaywrightError:
+            return False
 
     wait_for_stable(page)
     dismiss_overlays(page)
@@ -1311,6 +1535,8 @@ def run_registration(
     first_name_override: str | None = None,
     last_name_override: str | None = None,
     config: Config | None = None,
+    deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> RegistrationResult:
     """Fill and submit a (possibly multi-step) registration form. Never raises.
 
@@ -1326,6 +1552,16 @@ def run_registration(
     `config` is only needed for the screenshot+vision-LLM fallback (see
     vision_fallback.py) -- omitted (the default), that fallback is simply
     never attempted, same as when no vision model is configured.
+
+    `deadline` is a `time.monotonic()` timestamp (see orchestrator.py's
+    shared session deadline, Config.session_deadline_seconds) after which the
+    loop stops no matter how many steps remain. Omitted (the default), this
+    call gets its own standalone `_MAX_REGISTRATION_SECONDS` budget instead.
+
+    `cancelled`, if given, is polled the same way each iteration -- a
+    callable rather than a plain flag so the dashboard's Stop button (see
+    web.py) can request cancellation from another thread via a
+    `threading.Event` without this function needing to know about threads.
     """
     identity = identity or generate_identity(
         country=country,
@@ -1344,6 +1580,8 @@ def run_registration(
             temp_email_provider=temp_email_provider,
             max_steps=max_steps,
             config=config,
+            deadline=deadline,
+            cancelled=cancelled,
         )
     except Exception as exc:
         logger.exception("registration flow failed unexpectedly")
@@ -1366,6 +1604,8 @@ def _run_registration(
     temp_email_provider: TempEmailProvider | None,
     max_steps: int,
     config: Config | None,
+    deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> RegistrationResult:
     allow_google_oauth = bool(config and config.allow_google_oauth)
 
@@ -1388,13 +1628,31 @@ def _run_registration(
     vision_attempts = 0
     empty_retries = 0
     email_verification_required = False
+    phone_verification_required = False
     code_verification_attempted = False
     verification_code_entered = False
+    # An externally-supplied deadline (orchestrator.py's shared session
+    # budget) takes priority; falling back to this call's own standalone
+    # budget only when nothing shared was provided (e.g. tests, or
+    # registration.py used outside the orchestrator).
+    effective_deadline = (
+        deadline if deadline is not None else time.monotonic() + _MAX_REGISTRATION_SECONDS
+    )
     for _ in range(max_steps):
+        if cancelled is not None and cancelled():
+            run_logger.action("registration_cancelled", steps=steps_completed)
+            break
+        if time.monotonic() > effective_deadline:
+            run_logger.error(
+                f"registration timed out after {_MAX_REGISTRATION_SECONDS:.0f}s "
+                f"({steps_completed} step(s) completed)"
+            )
+            break
+
         dismiss_overlays(page)
         pages_before = len(page.context.pages)
 
-        if _captcha_challenge_visible(page):
+        if _captcha_challenge_visible(page) or _captcha_warning_visible(page):
             # Nothing safe left to do: we don't solve CAPTCHAs, and letting
             # the loop continue risks the choice-wizard/vision fallback
             # clicking whatever's left underneath the overlay instead (see
@@ -1557,6 +1815,21 @@ def _run_registration(
                 )
                 break
 
+            if _phone_verification_required(page):
+                # Same reasoning as the email branch above, but there's no
+                # equivalent solve path even in principle -- no receivable
+                # phone number is configured anywhere in this project.
+                phone_verification_required = True
+                run_logger.action("registration_pending_phone_verification", url=page.url)
+                capture_and_record(
+                    page,
+                    store,
+                    run_logger.run_id,
+                    ScreenshotKind.REGISTRATION,
+                    "registration pending phone verification",
+                )
+                break
+
             # The DOM-based heuristics above (fill/check/pick/submit) found
             # nothing at all -- genuinely stuck. Screenshot the page and ask
             # a vision-capable LLM to point at one of the same clickable
@@ -1602,9 +1875,32 @@ def _run_registration(
         False
         if verification_code_entered
         else _maybe_open_verification_link(
-            page, store, run_logger, inbox, temp_email_provider, submitted=submitted
+            page,
+            store,
+            run_logger,
+            inbox,
+            temp_email_provider,
+            submitted=submitted,
+            email_verification_required=email_verification_required,
         )
     )
+
+    if verification_opened and _phone_verification_required(page):
+        # The two gates can chain (seen live on shippingeasy.com: opening
+        # the email link lands directly on "Please Verify Your Phone
+        # Number") -- this only runs after a link was actually opened, so
+        # it's checking the page the link led to, not re-checking the page
+        # that was already handled by the loop's own phone-verification
+        # branch above.
+        phone_verification_required = True
+        run_logger.action("registration_pending_phone_verification", url=page.url)
+        capture_and_record(
+            page,
+            store,
+            run_logger.run_id,
+            ScreenshotKind.REGISTRATION,
+            "registration pending phone verification",
+        )
 
     store.add(
         run_logger.run_id,
@@ -1616,6 +1912,7 @@ def _run_registration(
             "verification_link_opened": verification_opened,
             "verification_code_entered": verification_code_entered,
             "email_verification_required": email_verification_required,
+            "phone_verification_required": phone_verification_required,
             "email": identity.email,
             "company_name": identity.company_name,
             "country": identity.country,
@@ -1628,6 +1925,7 @@ def _run_registration(
         submitted=submitted,
         verification_link_opened=verification_opened,
         email_verification_required=email_verification_required,
+        phone_verification_required=phone_verification_required,
         verification_code_entered=verification_code_entered,
     )
 
@@ -1640,8 +1938,24 @@ def _maybe_open_verification_link(
     temp_email_provider: TempEmailProvider | None,
     *,
     submitted: bool,
+    email_verification_required: bool,
 ) -> bool:
-    if not submitted or inbox is None or temp_email_provider is None:
+    # `submitted` alone missed a real case live on phishingbox.com: its
+    # signup form's own submit click was never recognized as one of
+    # _SUBMIT_BUTTON_TEXTS, so `submitted` stayed False even though the site
+    # had already emailed a verification link -- the page itself showed
+    # "check your email" text with nothing left to fill or click
+    # (_email_verification_required, gated on the same "genuinely stuck"
+    # branch that avoids false-triggering on marketing copy, see
+    # _run_registration). That phrase-plus-stuck signal is just as strong
+    # evidence the email was actually sent as a recognized submit click, so
+    # either one is enough to justify waiting on a real, already-configured
+    # inbox instead of giving up with the verification link sitting unread.
+    if (
+        not (submitted or email_verification_required)
+        or inbox is None
+        or temp_email_provider is None
+    ):
         return False
 
     link = temp_email_provider.wait_for_verification_link(inbox)

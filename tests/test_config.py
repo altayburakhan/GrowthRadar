@@ -15,7 +15,8 @@ def test_from_env_uses_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> N
     config = Config.from_env(env_path="/nonexistent/.env")
 
     assert config.llm_provider == "auto"
-    assert config.max_pages == 8
+    assert config.max_pages == 5
+    assert config.session_deadline_seconds == 160.0
     assert config.resolve_provider() == "heuristic"
     assert config.registrant_country == "United States"
     assert config.registrant_company is None

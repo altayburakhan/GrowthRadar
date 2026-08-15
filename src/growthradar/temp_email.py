@@ -38,6 +38,24 @@ _VERIFICATION_LINK_RE = re.compile(r'href=["\'](https?://[^"\'>\s]+)["\']', re.I
 # live (joinblink.com: 6 digits) without also matching things like a 10-digit
 # phone number or a longer tracking id.
 _VERIFICATION_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+# Strip <style>/<script> block contents entirely (their CSS/JS text can
+# itself contain stray digit runs, e.g. a hex color), then strip every
+# remaining tag -- which also removes tag *attributes* like
+# style="color:#040404", the biggest source of noise since those sit
+# directly inline next to real content rather than off in a footer.
+_HTML_STYLE_SCRIPT_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html_markup(body: str) -> str:
+    """No-op on plain text; on HTML, removes markup so a stray hex color or
+    other CSS/attribute value can never be mistaken for the OTP (seen live
+    on sproutsocial.com: a design-heavy transactional email with no
+    text/plain alternative -- an inline `style="color:#040404"` sitting near
+    the word "code" in the raw HTML got read as the verification code
+    itself, and the real one was never entered)."""
+    body = _HTML_STYLE_SCRIPT_RE.sub(" ", body)
+    return _HTML_TAG_RE.sub(" ", body)
 
 
 @dataclass(frozen=True)
@@ -165,6 +183,7 @@ def _extract_verification_code(body: str) -> str | None:
     year, an unsubscribe id, a tracking-pixel query param) that aren't the
     OTP, and some of those can still sort earlier in the text than the real
     code (e.g. a footer "© 2026" before a body "Your code is 918273")."""
+    body = _strip_html_markup(body)
     idx = body.lower().find("code")
     if idx != -1:
         window_start = max(0, idx - 100)

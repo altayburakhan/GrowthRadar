@@ -1,18 +1,23 @@
 import html
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import pytest
-from playwright.sync_api import Page
+from patchright.sync_api import Page
 
 from growthradar.browser import BrowserSession
 from growthradar.config import Config
 from growthradar.event_log import RunLogger
 from growthradar.evidence import EvidenceStore
-from growthradar.registration import open_registration_entry_point, run_registration
+from growthradar.registration import (
+    _find_clickable_by_keywords,
+    open_registration_entry_point,
+    run_registration,
+)
 from growthradar.temp_email import TempInbox
 
 _MULTI_STEP_FORM = """
@@ -186,6 +191,31 @@ _FORM_WITH_ARIA_CHECKBOX = """
     "></button>
   <input aria-hidden="true" tabindex="-1" type="checkbox"
     style="position:absolute; pointer-events:none; opacity:0;" />
+  I have read and accept the Terms and Conditions and Privacy Policy.
+</label>
+<button onclick="document.title='submitted';">Sign up</button>
+</body></html>
+"""
+
+
+# Mimics statusbrew.com's Angular Material-style checkbox: the native
+# <input> is the real, checkable control (unlike _FORM_WITH_ARIA_CHECKBOX's
+# pointer-events:none shadow input), but a custom visual indicator sits
+# absolutely positioned directly on top of it for styling, intercepting a
+# direct click/.check() at the input's own location. Only clicking the
+# wrapping <label> (which forwards a real click to its input via standard
+# browser behavior) gets through.
+_FORM_WITH_OVERLAY_INTERCEPTED_CHECKBOX = """
+<html><body>
+<input name="email" type="email" placeholder="Email" />
+<input name="password" type="password" placeholder="Password" />
+<label>
+  <span style="position:relative; display:inline-block; width:20px; height:20px;">
+    <input type="checkbox" id="terms"
+      style="position:absolute; top:0; left:0; width:20px; height:20px; opacity:0;" />
+    <span style="position:absolute; top:0; left:0; width:20px; height:20px;
+      background:white; border:1px solid #ccc;"></span>
+  </span>
   I have read and accept the Terms and Conditions and Privacy Policy.
 </label>
 <button onclick="document.title='submitted';">Sign up</button>
@@ -442,6 +472,25 @@ def test_checks_aria_role_checkbox_when_native_input_is_a_shadow_control(
 
     assert result.submitted is True
     assert page.locator('[role="checkbox"]').get_attribute("aria-checked") == "true"
+    store.close()
+
+
+def test_checks_native_checkbox_via_label_when_a_custom_indicator_intercepts_it(
+    tmp_path: Path, page: Page
+) -> None:
+    # Regression (statusbrew.com): the native checkbox is the real control
+    # (unlike the Radix/shadcn shadow-input case above), but a custom visual
+    # indicator sits directly on top of it, so Playwright's own actionability
+    # check correctly refuses a direct .check() ("intercepts pointer
+    # events") -- without a fallback, the box stayed unchecked, the "Agree
+    # and Sign up" button stayed disabled, and registration never submitted.
+    page.set_content(_FORM_WITH_OVERLAY_INTERCEPTED_CHECKBOX)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger)
+
+    assert result.submitted is True
+    assert page.locator("#terms").is_checked() is True
     store.close()
 
 
@@ -1087,6 +1136,28 @@ def test_entry_point_returns_false_when_nothing_matches(tmp_path: Path, page: Pa
     assert found is False
 
 
+def test_find_clickable_by_keywords_is_fast_on_a_link_heavy_page(page: Page) -> None:
+    # Regression (mirro.io): a marketing landing page with 188 clickable
+    # elements (mega-menus, footer links, ...) made a single
+    # _find_clickable_by_keywords search take well over a minute -- each
+    # candidate cost a separate .is_visible() plus a .inner_text(timeout=500)
+    # call, and each of those carries its own Playwright actionability-wait
+    # overhead. Two such searches (signup, then login) alone ate almost the
+    # entire per-site session budget before registration ever got a chance
+    # to start. A single-evaluate-per-candidate fast path (see
+    # _fast_visible_text) must still find the real match, just quickly.
+    filler_links = "".join(f'<a href="#">Learn more {i}</a>' for i in range(200))
+    page.set_content(f"<html><body>{filler_links}<a href='#'>Log in</a></body></html>")
+
+    start = time.monotonic()
+    found = _find_clickable_by_keywords(page, ("log in", "login", "sign in"))
+    elapsed = time.monotonic() - start
+
+    assert found is not None
+    assert found.inner_text().strip() == "Log in"
+    assert elapsed < 10.0, f"took {elapsed:.1f}s -- the slow per-candidate path regressed"
+
+
 # --- "Continue with email" fill+submit (GRO-31) -----------------------------
 
 # Mirrors allevents.in's real sign-in modal: OAuth buttons plus a bare email
@@ -1241,6 +1312,88 @@ def test_choice_picker_click_is_not_followed_by_a_same_iteration_submit_click(
     # Whichever card the choice-picker reaches first, only one click should
     # have happened this iteration -- never both.
     assert page.title() in ("card-a-clicked", "card-b-clicked")
+    store.close()
+
+
+# Regression (kamiapp.com's "try for free" page): four product-choice cards,
+# no plain form. A promotional banner link sits earlier in the DOM than any
+# real CTA and, before this fix, was clicked first every time, landing on an
+# unrelated HubSpot resource page. "talk to us" (a real, same-origin, non-
+# excluded link) isn't signup-flavored either and shouldn't win over "Create
+# a free account", which is both submit-like (matches "Create account") and
+# signup-flavored despite the inserted words. All the real hrefs here point
+# off-page (a data: URL's own scheme never matches https -- see
+# exploration.py's _in_scope) the same way kamiapp.com's actual CTAs route
+# through a third-party click-tracking redirect rather than kamiapp.com
+# itself, so this also exercises the offsite check's signup-flavored
+# exemption, not just the exclusion.
+_KAMI_STYLE_CHOICE_SCREEN = """
+<html><body>
+<a href="https://unrelated-hub.example/learn"
+   onclick="event.preventDefault(); document.title='clicked-banner';">
+  Find answers in the Learning Hub
+</a>
+<a href="https://tracker.example/click?x=1"
+   onclick="event.preventDefault(); document.title='clicked-sales';">
+  talk to us
+</a>
+<a href="https://tracker.example/click?x=2"
+   onclick="event.preventDefault(); document.title='clicked-create-account';">
+  Create a free account
+</a>
+</body></html>
+"""
+
+
+def test_choice_picker_prefers_a_signup_flavored_submit_like_option(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_KAMI_STYLE_CHOICE_SCREEN)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    run_registration(page, store, run_logger, max_steps=1)
+
+    assert page.title() == "clicked-create-account"
+    store.close()
+
+
+_KAMI_STYLE_CHOICE_SCREEN_WITHOUT_SUBMIT_MATCH = """
+<html><body>
+<a href="https://unrelated-hub.example/learn"
+   onclick="event.preventDefault(); document.title='clicked-banner';">
+  Find answers in the Learning Hub
+</a>
+<a href="#contact"
+   onclick="event.preventDefault(); document.title='clicked-sales';">
+  talk to us
+</a>
+<a href="https://tracker.example/click?x=3"
+   onclick="event.preventDefault(); document.title='clicked-trial';">
+  Sign your whole team up for free
+</a>
+</body></html>
+"""
+
+
+def test_choice_picker_excludes_offsite_banner_and_prefers_signup_wording(
+    tmp_path: Path, page: Page
+) -> None:
+    # "talk to us" is same-origin here (a relative href), same as it was on
+    # the real kamiapp.com page -- unaffected by the offsite check either
+    # way, but a plain, non-excluded candidate on its own merits.
+    # "Sign your whole team up for free" is deliberately worded so "sign"
+    # and "up" aren't adjacent: still word-subset-matches "sign up", but
+    # doesn't contain it as a literal substring, so it survives
+    # _CHOICE_EXCLUDE_KEYWORDS's existing signup-keyword exclusion (which
+    # predates this fix and always removes a literal "trial"/"sign up"/etc.
+    # substring match) and reaches this fix's new signup-flavor preference
+    # instead of merely being first-in-DOM-order.
+    page.set_content(_KAMI_STYLE_CHOICE_SCREEN_WITHOUT_SUBMIT_MATCH)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    run_registration(page, store, run_logger, max_steps=1)
+
+    assert page.title() == "clicked-trial"
     store.close()
 
 
@@ -1423,6 +1576,41 @@ def test_stops_registration_when_captcha_challenge_appears(tmp_path: Path, page:
     store.close()
 
 
+# A reCAPTCHA challenge can also present as just the small, un-solved
+# checkbox badge (well under _captcha_challenge_visible's 100px size floor)
+# paired with the site's own error copy -- seen live on paperbell.com:
+# "Sorry, you have triggered a security warning. Please click the box above
+# and try again." Without a phrase-based check alongside the size-based one,
+# the loop kept clicking "Create my account" every remaining iteration,
+# each click re-triggering the same warning and resetting the form, while
+# steps_completed/submitted still reported a normal successful click.
+_PAGE_WITH_SMALL_CAPTCHA_BADGE_AND_WARNING = """
+<html><body>
+<p>Sorry, you have triggered a security warning. Please click the box above and try again.</p>
+<iframe src="data:text/html,recaptcha-challenge-fixture" width="304" height="78"></iframe>
+<button onclick="document.title='submitted';">Create my account</button>
+</body></html>
+"""
+
+
+def test_stops_registration_when_captcha_warning_text_appears(tmp_path: Path, page: Page) -> None:
+    page.set_content(_PAGE_WITH_SMALL_CAPTCHA_BADGE_AND_WARNING)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, max_steps=5)
+
+    assert result.steps_completed == 0
+    assert result.submitted is False
+    assert page.title() != "submitted"
+
+    evidence = store.for_run(run_logger.run_id)
+    captcha_shots = [
+        e for e in evidence if e.label == "registration blocked by anti-bot challenge (captcha)"
+    ]
+    assert len(captcha_shots) == 1
+    store.close()
+
+
 # --- Iframe-embedded forms and lazily-loaded widgets (GRO-45) ---------------
 
 # Mirrors digifabster.com/getstarted/: the real signup form renders inside a
@@ -1529,4 +1717,108 @@ def test_flags_email_verification_gate_and_stops(tmp_path: Path, page: Page) -> 
 
     attempt = next(e for e in evidence if e.label == "registration attempt")
     assert attempt.visible_ui["email_verification_required"] is True
+    store.close()
+
+
+# Regression (phishingbox.com): the button that reveals the "check your
+# email" gate doesn't match any of _SUBMIT_BUTTON_TEXTS, so _click_submit
+# never fires and the click instead goes through the choice-picker fallback
+# -- `submitted` stays False even though the site plainly already emailed a
+# verification link. A configured, working inbox must still get used here,
+# not skipped just because our own submit-button wording heuristic missed
+# the click.
+_FORM_THEN_EMAIL_VERIFICATION_GATE_VIA_UNRECOGNIZED_BUTTON = """
+<html><body>
+<div id="form">
+  <button onclick="
+    document.getElementById('form').style.display='none';
+    document.getElementById('verify').style.display='block';
+  ">Go</button>
+</div>
+<div id="verify" style="display:none">
+  <h2>Check your email</h2>
+  <p>We sent you a link to verify your account. Please check your email to confirm your account.</p>
+</div>
+</body></html>
+"""
+
+
+def test_opens_verification_link_when_stuck_on_gate_without_a_recognized_submit_click(
+    tmp_path: Path, page: Page
+) -> None:
+    page.set_content(_FORM_THEN_EMAIL_VERIFICATION_GATE_VIA_UNRECOGNIZED_BUTTON)
+    store, run_logger = _store_and_logger(tmp_path)
+    verify_url = _data_url("<html><body><h1>You're verified!</h1></body></html>")
+    provider = _FakeTempEmailProvider(link=verify_url)
+
+    result = run_registration(page, store, run_logger, max_steps=5, temp_email_provider=provider)
+
+    assert result.submitted is False
+    assert result.email_verification_required is True
+    assert result.verification_link_opened is True
+    assert "verified" in page.content().lower()
+    store.close()
+
+
+# --- Phone verification gate (GRO-??: flag it, we have no way to solve it) --
+
+# Mirrors a phone/SMS gate with no email step at all -- the form submits
+# fine, but the account needs a code texted/called to a real phone number,
+# something this project has no way to receive.
+_FORM_THEN_PHONE_VERIFICATION_GATE = """
+<html><body>
+<div id="form">
+  <input type="email" placeholder="Email" />
+  <input type="password" placeholder="Password" />
+  <button onclick="
+    document.getElementById('form').style.display='none';
+    document.getElementById('verify').style.display='block';
+  ">Sign up</button>
+</div>
+<div id="verify" style="display:none">
+  <h2>Please Verify Your Phone Number</h2>
+  <p>To protect your account, we need to send a phone verification code.</p>
+</div>
+</body></html>
+"""
+
+
+def test_flags_phone_verification_gate_and_stops(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_THEN_PHONE_VERIFICATION_GATE)
+    store, run_logger = _store_and_logger(tmp_path)
+
+    result = run_registration(page, store, run_logger, max_steps=5)
+
+    assert result.submitted is True
+    assert result.phone_verification_required is True
+
+    evidence = store.for_run(run_logger.run_id)
+    verify_shots = [e for e in evidence if e.label == "registration pending phone verification"]
+    assert len(verify_shots) == 1
+
+    attempt = next(e for e in evidence if e.label == "registration attempt")
+    assert attempt.visible_ui["phone_verification_required"] is True
+    store.close()
+
+
+# Regression (shippingeasy.com): the two gates chain -- the email
+# verification link opens successfully ("Success! Your email is now
+# verified.") but lands directly on a phone-verification screen. This must
+# still get flagged even though it's discovered only after
+# _maybe_open_verification_link's own goto, not by the main loop's stuck
+# branch (there's nothing "stuck" about it -- the email link genuinely
+# worked).
+def test_flags_phone_verification_gate_reached_via_email_link(tmp_path: Path, page: Page) -> None:
+    page.set_content(_FORM_THEN_EMAIL_VERIFICATION_GATE)
+    store, run_logger = _store_and_logger(tmp_path)
+    phone_gate_url = _data_url(
+        "<html><body><h2>Please Verify Your Phone Number</h2>"
+        "<p>we need to send a phone verification code</p></body></html>"
+    )
+    provider = _FakeTempEmailProvider(link=phone_gate_url)
+
+    result = run_registration(page, store, run_logger, max_steps=5, temp_email_provider=provider)
+
+    assert result.verification_link_opened is True
+    assert result.phone_verification_required is True
     store.close()

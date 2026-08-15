@@ -10,6 +10,7 @@ build/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.md
 
 evidence/*
 !evidence/.gitkeep

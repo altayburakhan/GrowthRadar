@@ -38,18 +38,22 @@ giving up, instead of skipping registration outright.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from playwright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Error as PlaywrightError
 
 from growthradar.browser import BrowserSession
 from growthradar.config import Config
 from growthradar.event_log import RunLogger
-from growthradar.evidence import EvidenceStore
+from growthradar.evidence import Evidence, EvidenceStore
 from growthradar.exploration import (
+    _SIGNUP_KEYWORDS,
     DEFAULT_MAX_DEPTH,
     ExplorationEngine,
     ExplorationResult,
@@ -110,6 +114,7 @@ def run_growthradar_session(
     post_registration_max_depth: int = DEFAULT_POST_REGISTRATION_MAX_DEPTH,
     run_id: str | None = None,
     log_dir: str | Path = "logs",
+    cancel_event: threading.Event | None = None,
 ) -> RunOutcome:
     """Explore `url`, attempt registration, explore the authenticated app,
     score, and report.
@@ -117,6 +122,14 @@ def run_growthradar_session(
     Never raises: every phase is isolated, so this always returns a
     RunOutcome -- with a report built from whatever evidence was collected,
     even if some or all phases failed.
+
+    `cancel_event`, if given, is checked alongside the session deadline at
+    every phase's own checkpoints (see ExplorationEngine.run/registration.py's
+    loop) -- a caller running this on a background thread (the dashboard's
+    job executor, see web.py) can set it from the request-handling thread to
+    stop an in-progress run early. `threading.Event` is used specifically
+    because it's safe to signal across threads; Playwright's sync API itself
+    is not, so nothing here calls back into the browser session directly.
     """
     url = _normalize_target_url(url)
     config = config or Config.from_env()
@@ -147,6 +160,7 @@ def run_growthradar_session(
                     max_depth=max_depth,
                     max_post_registration_pages=max_post_registration_pages,
                     post_registration_max_depth=post_registration_max_depth,
+                    cancel_event=cancel_event,
                 )
                 errors.extend(phase_errors)
         except Exception as exc:
@@ -272,6 +286,7 @@ def _run_browser_phases(
     max_depth: int,
     max_post_registration_pages: int,
     post_registration_max_depth: int,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[
     ExplorationResult | None,
     RegistrationResult | None,
@@ -282,26 +297,39 @@ def _run_browser_phases(
     exploration_result: ExplorationResult | None = None
     registration_result: RegistrationResult | None = None
     post_registration_result: ExplorationResult | None = None
+    # One wall-clock ceiling shared across exploration + registration +
+    # post-registration exploration (Config.session_deadline_seconds) -- a
+    # per-phase-only budget let a slow-but-not-failing site (seen live on
+    # squareup.com) pad out its page/step budgets' worth of time several
+    # times over, phase after phase, with no ceiling on the total.
+    deadline = time.monotonic() + config.session_deadline_seconds
+    cancelled = cancel_event.is_set if cancel_event is not None else None
 
     try:
         engine = ExplorationEngine.from_config(
             session, store, run_logger, config, max_depth=max_depth
         )
-        exploration_result = engine.run(url)
+        exploration_result = engine.run(url, deadline=deadline, cancelled=cancelled)
     except Exception as exc:
         logger.exception("exploration phase failed")
         run_logger.error(f"exploration phase failed: {exc}")
         errors.append(f"exploration: {exc}")
 
-    if attempt_registration:
+    if attempt_registration and not (cancelled is not None and cancelled()):
         try:
-            registration_result = _attempt_registration(session, store, run_logger, config, url)
+            registration_result = _attempt_registration(
+                session, store, run_logger, config, url, deadline=deadline, cancelled=cancelled
+            )
         except Exception as exc:
             logger.exception("registration phase failed")
             run_logger.error(f"registration phase failed: {exc}")
             errors.append(f"registration: {exc}")
 
-        if registration_result is not None and registration_result.submitted:
+        if (
+            registration_result is not None
+            and registration_result.submitted
+            and not (cancelled is not None and cancelled())
+        ):
             try:
                 post_registration_result = _explore_authenticated_app(
                     session,
@@ -311,6 +339,8 @@ def _run_browser_phases(
                     original_url=url,
                     max_pages=max_post_registration_pages,
                     max_depth=post_registration_max_depth,
+                    deadline=deadline,
+                    cancelled=cancelled,
                 )
             except Exception as exc:
                 logger.exception("post-registration exploration failed")
@@ -334,6 +364,8 @@ def _explore_authenticated_app(
     original_url: str,
     max_pages: int,
     max_depth: int,
+    deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ExplorationResult | None:
     """After a successful signup, keep exploring from wherever registration
     left the browser -- the now-authenticated app -- with its own bounded
@@ -370,19 +402,42 @@ def _explore_authenticated_app(
         max_depth=max_depth,
         crawl_delay=config.crawl_delay,
     )
-    return engine.run(start_url, initial_kind=ScreenshotKind.ONBOARDING)
+    return engine.run(
+        start_url, initial_kind=ScreenshotKind.ONBOARDING, deadline=deadline, cancelled=cancelled
+    )
+
+
+def _signup_keyword_hits(e: Evidence) -> int:
+    haystack = f"{e.label} {e.url}".lower().replace("-", " ").replace("_", " ")
+    return sum(keyword in haystack for keyword in _SIGNUP_KEYWORDS)
 
 
 def _find_registration_page_url(store: EvidenceStore, run_id: str) -> str | None:
-    for e in store.for_run(run_id):
+    candidates = [
+        e
+        for e in store.for_run(run_id)
         if (
             e.label.startswith("screenshot:")
             and isinstance(e.visible_ui, dict)
             and e.visible_ui.get("screenshot_kind") == "registration"
             and e.url
-        ):
-            return e.url
-    return None
+        )
+    ]
+    if not candidates:
+        return None
+    # More than one visited page can get classified "registration" just from
+    # a nav link's text (e.g. a "Free Trial" button pointing at a pricing
+    # page) even when the actual signup FORM lives elsewhere entirely (seen
+    # live on statusbrew.com: a "Free Trial" link led to /pricing -- a plan
+    # comparison page with no form on it at all -- while the real target,
+    # space.statusbrew.com/get-started, titled "Sign up | Statusbrew", was
+    # visited moments later and never picked because the first match always
+    # won). Prefer whichever candidate's own URL+title most directly names
+    # the signup flow, not just the first one the crawl happened to reach;
+    # ties keep list order (max() is stable), so this is a pure improvement
+    # when nothing outranks the old first-match behavior.
+    best = max(candidates, key=_signup_keyword_hits)
+    return best.url
 
 
 def _temp_email_provider_from_config(config: Config) -> TempEmailProvider | None:
@@ -421,6 +476,9 @@ def _attempt_registration(
     run_logger: RunLogger,
     config: Config,
     landing_url: str,
+    *,
+    deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> RegistrationResult | None:
     target_url = _find_registration_page_url(store, run_logger.run_id)
 
@@ -462,6 +520,8 @@ def _attempt_registration(
         last_name_override=config.registrant_last_name,
         config=config,
         temp_email_provider=_temp_email_provider_from_config(config),
+        deadline=deadline,
+        cancelled=cancelled,
     )
     # run_registration may have followed a new tab internally (see
     # registration.py's _switch_to_new_page) -- that only rebinds its own

@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import logging
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Locator, Page
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import Locator, Page
 
 from growthradar.dom import NavItem
 

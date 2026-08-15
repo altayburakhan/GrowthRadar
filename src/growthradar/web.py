@@ -18,7 +18,7 @@ import logging
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -46,11 +46,17 @@ _SCREENSHOT_DIR.mkdir(exist_ok=True)
 class JobState:
     run_id: str
     url: str
-    status: str  # "running" | "done" | "error"
+    status: str  # "running" | "done" | "error" | "cancelled"
     started_at: str
     config: Config
     outcome: RunOutcome | None = None
     error: str | None = None
+    # Signals a Stop click across threads to run_growthradar_session, which
+    # polls it at each phase's own checkpoints (see orchestrator.py) --
+    # threading.Event.set()/is_set() are safe to call cross-thread, unlike
+    # Playwright's sync API itself, so nothing here reaches into the browser
+    # session directly.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 _jobs: dict[str, JobState] = {}
@@ -66,10 +72,11 @@ def _execute(job: JobState, *, headless: bool, attempt_registration: bool) -> No
             run_id=job.run_id,
             headless=headless,
             attempt_registration=attempt_registration,
+            cancel_event=job.cancel_event,
         )
         with _jobs_lock:
             job.outcome = outcome
-            job.status = "done"
+            job.status = "cancelled" if job.cancel_event.is_set() else "done"
     except Exception as exc:  # last-resort safety net; run_growthradar_session shouldn't raise
         logger.exception("dashboard run %s failed unexpectedly", job.run_id)
         with _jobs_lock:
@@ -272,13 +279,24 @@ def create_app() -> FastAPI:
             "status": job.status,
             "started_at": job.started_at,
         }
-        if job.status == "done" and job.outcome is not None:
+        if job.status in ("done", "cancelled") and job.outcome is not None:
             payload["report"] = to_dict(job.outcome.report)
             payload["errors"] = list(job.outcome.errors)
             payload["screenshots"] = _screenshots_for_run(job.config, run_id)
         elif job.status == "error":
             payload["error"] = job.error
         return payload
+
+    @app.post("/api/runs/{run_id}/stop")
+    def stop_run(run_id: str) -> dict[str, str]:
+        with _jobs_lock:
+            job = _jobs.get(run_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        if job.status != "running":
+            return {"run_id": run_id, "status": job.status}
+        job.cancel_event.set()
+        return {"run_id": run_id, "status": "stopping"}
 
     @app.post("/api/batch")
     async def start_batch(file: UploadFile = File(...)) -> dict[str, Any]:
@@ -359,6 +377,11 @@ _INDEX_HTML = """<!doctype html>
     padding: 10px 18px; font-size: 14px; cursor: pointer; font-weight: 600;
   }
   button:disabled { opacity: 0.5; cursor: default; }
+  .stop-btn {
+    background: none; border: 1px solid var(--hot); color: var(--hot);
+    padding: 3px 10px; font-size: 12px; border-radius: 6px; font-weight: 600;
+  }
+  .stop-btn:hover { background: color-mix(in srgb, var(--hot) 12%, transparent); }
   .status-line { margin-top: 14px; font-size: 13px; color: var(--muted); display: none; }
   .status-line.active { display: block; }
   .spinner {
@@ -417,6 +440,34 @@ _INDEX_HTML = """<!doctype html>
   .batch-status.error, .batch-status.invalid { color: var(--hot); }
   .batch-status.running { color: var(--warm); }
   .empty { color: var(--muted); font-size: 13px; }
+  .active-banner {
+    background: color-mix(in srgb, var(--warm) 15%, var(--panel)); border: 1px solid var(--warm);
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 20px;
+  }
+  .active-banner a { color: var(--accent); font-weight: 600; }
+  .shots button.thumb {
+    display: block; width: 100%; border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden; background: none; padding: 0; cursor: pointer; text-align: left;
+  }
+  .shots button.thumb img { width: 100%; height: 110px; object-fit: cover; display: block; background: var(--bg); }
+  .shots button.thumb .cap { font-size: 11px; color: var(--muted); padding: 6px 8px; }
+  .lightbox {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+    z-index: 1000; align-items: center; justify-content: center; padding: 40px;
+  }
+  .lightbox.open { display: flex; }
+  .lightbox-inner { max-width: 100%; max-height: 100%; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .lightbox img { max-width: 100%; max-height: calc(100vh - 120px); border-radius: 8px; object-fit: contain; }
+  .lightbox .cap { color: #fff; font-size: 13px; opacity: 0.85; }
+  .lightbox .close-btn, .lightbox .nav-btn {
+    position: fixed; background: rgba(255,255,255,0.1); color: #fff; border: none;
+    border-radius: 50%; width: 44px; height: 44px; font-size: 20px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .lightbox .close-btn:hover, .lightbox .nav-btn:hover { background: rgba(255,255,255,0.25); }
+  .lightbox .close-btn { top: 20px; right: 20px; }
+  .lightbox .nav-btn.prev { left: 20px; top: 50%; transform: translateY(-50%); }
+  .lightbox .nav-btn.next { right: 20px; top: 50%; transform: translateY(-50%); }
 </style>
 </head>
 <body>
@@ -449,11 +500,23 @@ _INDEX_HTML = """<!doctype html>
     <div id="batchList"></div>
   </div>
 
+  <div id="activeBanner" class="active-banner" style="display:none"></div>
+
   <div id="reportPanel"></div>
 
   <div class="panel">
     <h2 style="margin-top:0; font-size:15px;">Gecmis calismalar</h2>
     <div id="historyList" class="empty">Yukleniyor...</div>
+  </div>
+</div>
+
+<div id="lightbox" class="lightbox">
+  <button class="close-btn" id="lightboxClose" title="Kapat (Esc)">&times;</button>
+  <button class="nav-btn prev" id="lightboxPrev" title="Onceki (&larr;)">&#8592;</button>
+  <button class="nav-btn next" id="lightboxNext" title="Sonraki (&rarr;)">&#8594;</button>
+  <div class="lightbox-inner">
+    <img id="lightboxImg" src="" alt="" />
+    <div class="cap" id="lightboxCap"></div>
   </div>
 </div>
 
@@ -465,8 +528,87 @@ const historyList = document.getElementById('historyList');
 const batchBtn = document.getElementById('batchBtn');
 const batchStatusLine = document.getElementById('batchStatusLine');
 const batchList = document.getElementById('batchList');
+const lightbox = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxCap = document.getElementById('lightboxCap');
 let pollTimer = null;
 let batchPollTimer = null;
+// The scan currently running server-side (if any) vs. whichever run's report
+// is on screen right now -- these used to be the same thing implicitly, so
+// clicking a history row while a scan was running called clearInterval on
+// its poll loop and abandoned it for good, with no way back (see viewRun).
+// Tracking them separately lets browsing history leave the live scan's
+// polling untouched in the background.
+let activeRunId = null;
+let viewingRunId = null;
+
+function runningStatusHtml() {
+  return `<span class="spinner"></span>Calisiyor... ` +
+    `<button type="button" class="stop-btn" onclick="stopActiveRun()">Durdur</button>`;
+}
+
+async function stopActiveRun() {
+  if (!activeRunId) return;
+  const btns = document.querySelectorAll('.stop-btn');
+  btns.forEach(b => { b.disabled = true; b.textContent = 'Durduruluyor...'; });
+  await fetch(`/api/runs/${activeRunId}/stop`, { method: 'POST' });
+  // The background poll (see poll()) picks up the resulting status change
+  // on its own next tick -- no need to force a refresh here.
+}
+
+function renderActiveBanner() {
+  const banner = document.getElementById('activeBanner');
+  if (activeRunId && viewingRunId !== activeRunId) {
+    banner.style.display = 'block';
+    banner.innerHTML = `<span class="spinner"></span>Bir tarama hala calisiyor -- ` +
+      `<a href="#" onclick="viewRun('${activeRunId}'); return false;">canli taramaya don</a>` +
+      ` -- <button type="button" class="stop-btn" onclick="stopActiveRun()">Durdur</button>`;
+  } else {
+    banner.style.display = 'none';
+  }
+}
+let currentShots = [];
+let currentShotIndex = 0;
+
+function openLightbox(index) {
+  if (!currentShots.length) return;
+  currentShotIndex = index;
+  showCurrentShot();
+  lightbox.classList.add('open');
+}
+
+function closeLightbox() {
+  lightbox.classList.remove('open');
+}
+
+function showCurrentShot() {
+  const s = currentShots[currentShotIndex];
+  lightboxImg.src = s.url;
+  lightboxCap.textContent = `${s.kind || 'page'}${s.page_url ? ' -- ' + s.page_url : ''} (${currentShotIndex + 1}/${currentShots.length})`;
+}
+
+function showNextShot() {
+  if (!currentShots.length) return;
+  currentShotIndex = (currentShotIndex + 1) % currentShots.length;
+  showCurrentShot();
+}
+
+function showPrevShot() {
+  if (!currentShots.length) return;
+  currentShotIndex = (currentShotIndex - 1 + currentShots.length) % currentShots.length;
+  showCurrentShot();
+}
+
+document.getElementById('lightboxClose').addEventListener('click', closeLightbox);
+document.getElementById('lightboxNext').addEventListener('click', showNextShot);
+document.getElementById('lightboxPrev').addEventListener('click', showPrevShot);
+lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
+document.addEventListener('keydown', e => {
+  if (!lightbox.classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowRight') showNextShot();
+  else if (e.key === 'ArrowLeft') showPrevShot();
+});
 
 const _BATCH_STATUS_LABELS = {
   queued: 'sirada', running: 'calisiyor', done: 'tamamlandi',
@@ -488,12 +630,13 @@ function renderBar(label, dim) {
 function renderReport(data) {
   const r = data.report;
   const shots = data.screenshots || [];
+  currentShots = shots;
   const shotsHtml = shots.length
-    ? `<div class="shots">${shots.map(s => `
-        <a href="${s.url}" target="_blank" rel="noopener">
+    ? `<div class="shots">${shots.map((s, i) => `
+        <button type="button" class="thumb" onclick="openLightbox(${i})">
           <img src="${s.url}" loading="lazy" />
           <div class="cap">${s.kind || 'page'}</div>
-        </a>`).join('')}</div>`
+        </button>`).join('')}</div>`
     : '<p class="empty">Ekran goruntusu yok.</p>';
 
   const pagesHtml = r.explored_pages.length
@@ -525,6 +668,10 @@ function renderReport(data) {
     ? `<div class="recommendation competitor">✉️ <strong>Bu site email dogrulamasi istiyor</strong> -- kayit formu dolduruldu ama hesap, gercek bir gelen kutusundaki linke tiklanmadan aktif olmuyor; otomatik akis burada duruyor.</div>`
     : '';
 
+  const phoneVerificationHtml = r.phone_verification_required
+    ? `<div class="recommendation competitor">📱 <strong>Bu site telefon dogrulamasi istiyor</strong> -- hesap, gercek bir telefona SMS/arama ile gelen koda ihtiyac duyuyor; bu proje henuz SMS/arama alabilen bir numaraya baglanmadigi icin otomatik akis burada duruyor.</div>`
+    : '';
+
   reportPanel.innerHTML = `
     <div class="panel">
       <div class="report-head">
@@ -533,10 +680,12 @@ function renderReport(data) {
       </div>
       ${competitorHtml}
       ${emailVerificationHtml}
+      ${phoneVerificationHtml}
       <dl class="fields">
         <dt>Urun</dt><dd>${r.product_url || '-'}</dd>
         <dt>Kayit tamamlandi</dt><dd>${r.registration_completed ? 'Evet' : 'Hayir'}</dd>
         <dt>Email dogrulama gerekiyor</dt><dd>${r.email_verification_required ? 'Evet' : 'Hayir'}</dd>
+        <dt>Telefon dogrulama gerekiyor</dt><dd>${r.phone_verification_required ? 'Evet' : 'Hayir'}</dd>
         <dt>Deneme surumu</dt><dd>${r.trial_available ? 'Var' : 'Yok'}</dd>
         <dt>Onboarding tespit edildi</dt><dd>${r.onboarding_detected ? 'Evet' : 'Hayir'}</dd>
         <dt>Toplanan kanit</dt><dd>${r.evidence_collected}</dd>
@@ -566,19 +715,34 @@ async function poll(runId) {
   const data = await res.json();
 
   if (data.status === 'running') {
-    statusLine.innerHTML = `<span class="spinner"></span>Calisiyor...`;
+    if (viewingRunId === runId) {
+      statusLine.innerHTML = runningStatusHtml();
+    }
+    renderActiveBanner();
     return;
   }
   clearInterval(pollTimer);
+  pollTimer = null;
+  if (activeRunId === runId) { activeRunId = null; }
   startBtn.disabled = false;
+  loadHistory();
+  renderActiveBanner();
+
+  // The user may have clicked away to a different (historical) run while
+  // this one finished in the background -- don't yank the report they're
+  // looking at out from under them; renderActiveBanner's "canli taramaya
+  // don" link (now hidden, since activeRunId just cleared) already covered
+  // the "get back to it" need while it was still running.
+  if (viewingRunId !== runId) { return; }
 
   if (data.status === 'error') {
     statusLine.innerHTML = `Basarisiz: ${data.error || 'bilinmeyen hata'}`;
     return;
   }
-  statusLine.innerHTML = 'Tamamlandi.';
+  statusLine.innerHTML = data.status === 'cancelled'
+    ? 'Durduruldu -- o ana kadar toplanan kanitlarla rapor asagida.'
+    : 'Tamamlandi.';
   renderReport(data);
-  loadHistory();
 }
 
 async function startRun() {
@@ -613,16 +777,23 @@ async function startRun() {
     return;
   }
   const data = await res.json();
+  activeRunId = data.run_id;
+  viewingRunId = data.run_id;
+  if (pollTimer) { clearInterval(pollTimer); }
   pollTimer = setInterval(() => poll(data.run_id), 2000);
   poll(data.run_id);
 }
 
 async function viewRun(runId) {
-  if (pollTimer) { clearInterval(pollTimer); }
+  // Deliberately does NOT touch pollTimer/activeRunId -- a still-running
+  // scan keeps polling in the background no matter which report is on
+  // screen (see poll()), so browsing history can never lose its progress.
+  viewingRunId = runId;
   startBtn.disabled = false;
   reportPanel.innerHTML = '';
   statusLine.classList.add('active');
   statusLine.innerHTML = `<span class="spinner"></span>Yukleniyor...`;
+  renderActiveBanner();
 
   const res = await fetch(`/api/runs/${runId}`);
   if (!res.ok) {
@@ -630,11 +801,17 @@ async function viewRun(runId) {
     return;
   }
   const data = await res.json();
+  if (data.status === 'running') {
+    statusLine.innerHTML = runningStatusHtml();
+    return;
+  }
   if (data.status === 'error') {
     statusLine.innerHTML = `Basarisiz: ${data.error || 'bilinmeyen hata'}`;
     return;
   }
-  statusLine.innerHTML = 'Tamamlandi.';
+  statusLine.innerHTML = data.status === 'cancelled'
+    ? 'Durduruldu -- o ana kadar toplanan kanitlarla rapor asagida.'
+    : 'Tamamlandi.';
   renderReport(data);
 }
 
