@@ -14,7 +14,7 @@ that's the source of truth for *why* a given piece of logic exists.
 ## Setup
 
 ```bash
-make install-dev   # creates .venv, installs deps, downloads the Chromium browser
+make install-dev   # creates .venv, installs deps, installs a Patchright-managed Chrome
 cp .env.example .env
 # fill in GROQ_API_KEY in .env (optional -- see Configuration below)
 ```
@@ -147,7 +147,7 @@ raises `ConfigError` with a clear message if something's wrong.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` / `GROQ_MODEL` | — / `llama-3.3-70b-versatile` | Only LLM provider this project uses -- powers `llm_summary.py`'s plain-English explanation of the verdict only; scoring itself is always rule-based. Leave blank to skip it |
+| `GROQ_API_KEY` / `GROQ_MODEL` | — / `openai/gpt-oss-120b` | Only LLM provider this project uses -- powers `llm_summary.py`'s plain-English explanation of the verdict only; scoring itself is always rule-based. Leave blank to skip it. Groq's model lineup churns (this default has already changed once); if summaries silently stop appearing, check `GET /openai/v1/models` against your key before assuming something else broke |
 | `GROWTHRADAR_LLM_PROVIDER` | `auto` | `auto` picks Groq if a key is set, otherwise heuristic, or force `groq`/`heuristic` |
 | `GROWTHRADAR_REQUEST_TIMEOUT` | `10` | Seconds Playwright waits per navigation/action |
 | `GROWTHRADAR_MAX_PAGES` | `8` | Exploration budget per run |

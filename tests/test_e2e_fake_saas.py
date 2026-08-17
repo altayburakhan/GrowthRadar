@@ -104,6 +104,13 @@ def test_full_pipeline_against_fake_saas_site(tmp_path: Path, config: Config) ->
         site["home"], config=config, run_id="e2e-run", log_dir=tmp_path
     )
 
+    # channel="chrome" (see browser.py) needs a real, separately-installed
+    # Google Chrome (`patchright install chrome`), not the bundled Chromium.
+    # Skip rather than fail where it isn't present, instead of every other
+    # assertion below failing for the same unrelated reason.
+    if any("chrome" in e.lower() and "not found" in e.lower() for e in outcome.errors):
+        pytest.skip(f"Google Chrome not installed: {outcome.errors}")
+
     # -- Exploration: every page was discovered and visited --
     assert outcome.exploration is not None
     visited_urls = {v.url for v in outcome.exploration.visited if v.success}

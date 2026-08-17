@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -39,8 +40,19 @@ logger = logging.getLogger(__name__)
 
 _GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 _REQUEST_TIMEOUT_SECONDS = 20
-_MAX_TOKENS = 220
+# The default GROQ_MODEL (openai/gpt-oss-120b) is a reasoning model --
+# Groq counts its internal reasoning against max_tokens before the final
+# answer, so a budget sized for the answer alone (previously 220) got cut
+# off mid-sentence (finish_reason="length") on this project's actual
+# prompt/facts shape; 500 leaves enough room for both.
+_MAX_TOKENS = 500
 _CONFIDENT_THRESHOLD = 0.65
+# Some Groq models (e.g. qwen3.6, used for GROQ_VISION_MODEL -- see
+# vision_fallback.py) inline their reasoning as a <think>...</think> block
+# ahead of the actual answer, unlike gpt-oss's separate `reasoning` field.
+# Stripping defensively here means switching GROQ_MODEL to one of those
+# later doesn't leak raw reasoning into the report's "AI summary" section.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _PROMPT_TEMPLATE = """You are a sales analyst summarizing an automated evaluation of a SaaS \
 product as a potential customer for UserGuiding (a user-onboarding platform). Based ONLY on \
@@ -178,7 +190,9 @@ def _call_groq(prompt: str, config: Config) -> str | None:
         logger.warning("Groq summary: no choices in response")
         return None
     content = (choices[0].get("message") or {}).get("content")
-    return str(content).strip() if content else None
+    if not content:
+        return None
+    return _THINK_BLOCK_RE.sub("", str(content)).strip() or None
 
 
 def summarize_evidence(evidence: list[Evidence], score: ScoreResult, config: Config) -> str | None:

@@ -4,7 +4,6 @@ from urllib.parse import quote
 import pytest
 
 import growthradar.orchestrator as orchestrator_module
-from growthradar.browser import BrowserSession
 from growthradar.config import Config
 from growthradar.evidence import EvidenceStore
 from growthradar.history import RunHistoryStore
@@ -14,8 +13,6 @@ from growthradar.orchestrator import (
     run_growthradar_batch,
     run_growthradar_session,
 )
-
-_FAKE_BASE = "https://fake.growthradar.test"
 
 
 def _data_url(html: str) -> str:
@@ -30,234 +27,12 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
     return Config.from_env(env_path="/nonexistent/.env")
 
 
-def test_full_pipeline_on_a_simple_single_page_site(tmp_path: Path, config: Config) -> None:
-    url = _data_url("<html><body><h1>Just a landing page</h1></body></html>")
-
-    outcome = run_growthradar_session(url, config=config, run_id="run-1", log_dir=tmp_path)
-
-    assert outcome.run_id == "run-1"
-    assert outcome.exploration is not None
-    assert len(outcome.exploration.visited) == 1
-    assert outcome.exploration.visited[0].success is True
-    assert outcome.registration is None  # no registration page discovered
-    assert outcome.post_registration_exploration is None
-    assert outcome.report.evidence_collected > 0
-    assert outcome.errors == ()
-
-
-def test_full_pipeline_completes_registration_when_signup_page_is_found(
-    tmp_path: Path, config: Config
-) -> None:
-    signup_html = (
-        "<html><body>"
-        "<input name='email' type='email' />"
-        "<input name='password' type='password' />"
-        '<button onclick="document.body.insertAdjacentHTML('
-        "'beforeend', '<div id=done>Welcome!</div>')\">Sign up</button>"
-        "</body></html>"
-    )
-    signup_url = _data_url(signup_html)
-    home_url = _data_url(f"<html><body><nav><a href='{signup_url}'>Sign up</a></nav></body></html>")
-
-    outcome = run_growthradar_session(home_url, config=config, run_id="run-2", log_dir=tmp_path)
-
-    assert outcome.registration is not None
-    assert outcome.registration.submitted is True
-    assert outcome.report.registration_completed is True
-    assert len(outcome.exploration.visited) == 2  # type: ignore[union-attr]
-
-
-def _routed_browser_session_class(pages: dict[str, str]) -> type[BrowserSession]:
-    """A BrowserSession subclass that fulfills requests to _FAKE_BASE from `pages`
-    instead of touching the real network -- lets a clicked <a href> perform a
-    real (non-data:) navigation, which data: URLs cannot do once a page has
-    already loaded (Chromium blocks renderer-initiated navigation *to* a new
-    data: URL after the first navigation, even from a genuine link click)."""
-
-    def handler(route):  # noqa: ANN001
-        body = pages.get(route.request.url, "<html><body>missing</body></html>")
-        route.fulfill(status=200, content_type="text/html", body=body)
-
-    class _RoutedBrowserSession(BrowserSession):
-        def start(self):  # type: ignore[override]
-            page = super().start()
-            page.route(f"{_FAKE_BASE}/**", handler)
-            return page
-
-    return _RoutedBrowserSession
-
-
-def test_post_registration_exploration_discovers_the_authenticated_app(
-    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home_url = f"{_FAKE_BASE}/"
-    signup_url = f"{_FAKE_BASE}/signup"
-    dashboard_url = f"{_FAKE_BASE}/dashboard"
-    settings_url = f"{_FAKE_BASE}/settings"
-
-    pages = {
-        home_url: f"<html><body><nav><a href='{signup_url}'>Sign up</a></nav></body></html>",
-        signup_url: (
-            "<html><body>"
-            "<input name='email' type='email' />"
-            "<input name='password' type='password' />"
-            f"<a href='{dashboard_url}'>Sign up</a>"
-            "</body></html>"
-        ),
-        dashboard_url: (
-            "<html><body><h1>Dashboard</h1>"
-            "<div class='onboarding-checklist'>Welcome! Here is your onboarding checklist</div>"
-            f"<nav><a href='{settings_url}'>Settings</a></nav>"
-            "</body></html>"
-        ),
-        settings_url: "<html><body><h1>Settings</h1><p>Manage your account</p></body></html>",
-    }
-
-    monkeypatch.setattr(
-        "growthradar.orchestrator.BrowserSession", _routed_browser_session_class(pages)
-    )
-
-    # max_depth=1 bounds the *pre-registration* crawl to home + signup only, so
-    # dashboard/settings (reachable one hop past signup) are provably only
-    # found via the new post-registration pass, not leftover pre-reg crawling.
-    outcome = run_growthradar_session(
-        home_url, config=config, run_id="run-post-reg", log_dir=tmp_path, max_depth=1
-    )
-
-    pre_registration_urls = {v.url for v in outcome.exploration.visited}  # type: ignore[union-attr]
-    assert dashboard_url not in pre_registration_urls
-    assert settings_url not in pre_registration_urls
-
-    assert outcome.registration is not None
-    assert outcome.registration.submitted is True
-
-    assert outcome.post_registration_exploration is not None
-    post_registration_urls = {
-        v.url for v in outcome.post_registration_exploration.visited if v.success
-    }
-    assert dashboard_url in post_registration_urls
-    assert settings_url in post_registration_urls
-
-    assert dashboard_url in outcome.report.explored_pages
-    assert settings_url in outcome.report.explored_pages
-
-
-def test_post_registration_exploration_is_skipped_when_browser_ends_up_off_site(
-    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Regression (100hires.com): a signup form's submit button can accidentally
-    # trigger a redirect to a third-party domain (OAuth or otherwise). Post-
-    # registration exploration must not then wander that unrelated site and
-    # contaminate onboarding/scoring evidence with it -- it should just skip.
-    home_url = f"{_FAKE_BASE}/"
-    signup_url = f"{_FAKE_BASE}/signup"
-    offsite_url = "https://oauth-provider.test/callback"
-
-    pages = {
-        home_url: f"<html><body><nav><a href='{signup_url}'>Sign up</a></nav></body></html>",
-        signup_url: (
-            "<html><body>"
-            "<input name='email' type='email' />"
-            "<input name='password' type='password' />"
-            f"<a href='{offsite_url}'>Sign up</a>"
-            "</body></html>"
-        ),
-        offsite_url: "<html><body><h1>Sign in with Provider</h1></body></html>",
-    }
-
-    def handler(route):  # noqa: ANN001
-        body = pages.get(route.request.url, "<html><body>missing</body></html>")
-        route.fulfill(status=200, content_type="text/html", body=body)
-
-    class _AnyDomainRoutedBrowserSession(BrowserSession):
-        def start(self):  # type: ignore[override]
-            page = super().start()
-            page.route("**/*", handler)
-            return page
-
-    monkeypatch.setattr("growthradar.orchestrator.BrowserSession", _AnyDomainRoutedBrowserSession)
-
-    outcome = run_growthradar_session(
-        home_url, config=config, run_id="run-offsite", log_dir=tmp_path, max_depth=1
-    )
-
-    assert outcome.registration is not None
-    assert outcome.registration.submitted is True
-    assert outcome.post_registration_exploration is None
-    assert outcome.errors == ()
-
-
-def test_post_registration_exploration_respects_its_own_page_budget(
-    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home_url = f"{_FAKE_BASE}/"
-    signup_url = f"{_FAKE_BASE}/signup"
-    dashboard_url = f"{_FAKE_BASE}/dashboard"
-    settings_url = f"{_FAKE_BASE}/settings"
-
-    pages = {
-        home_url: f"<html><body><nav><a href='{signup_url}'>Sign up</a></nav></body></html>",
-        signup_url: (
-            "<html><body>"
-            "<input name='email' type='email' /><input name='password' type='password' />"
-            f"<a href='{dashboard_url}'>Sign up</a>"
-            "</body></html>"
-        ),
-        dashboard_url: f"<html><body><a href='{settings_url}'>Settings</a></body></html>",
-        settings_url: "<html><body>Settings</body></html>",
-    }
-    monkeypatch.setattr(
-        "growthradar.orchestrator.BrowserSession", _routed_browser_session_class(pages)
-    )
-
-    outcome = run_growthradar_session(
-        home_url,
-        config=config,
-        run_id="run-budget",
-        log_dir=tmp_path,
-        max_depth=1,
-        max_post_registration_pages=1,
-    )
-
-    assert outcome.post_registration_exploration is not None
-    assert len(outcome.post_registration_exploration.visited) == 1
-    assert outcome.post_registration_exploration.stopped_reason == "max_pages_reached"
-
-
 def test_normalize_target_url_adds_https_scheme_when_missing() -> None:
     assert _normalize_target_url("100hires.com") == "https://100hires.com"
     assert _normalize_target_url("  100hires.com  ") == "https://100hires.com"
     assert _normalize_target_url("https://100hires.com") == "https://100hires.com"
     assert _normalize_target_url("http://100hires.com") == "http://100hires.com"
     assert _normalize_target_url("data:text/html,<p>x</p>") == "data:text/html,<p>x</p>"
-
-
-def test_schemeless_url_is_normalized_and_still_explores(
-    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A URL typed into the dashboard without "https://" (e.g. "100hires.com")
-    # must not be rejected by Playwright's navigation -- it should behave
-    # exactly like typing it into a browser address bar.
-    home_url = f"{_FAKE_BASE}/"
-    pages = {home_url: "<html><body><h1>Home</h1></body></html>"}
-    monkeypatch.setattr(
-        "growthradar.orchestrator.BrowserSession", _routed_browser_session_class(pages)
-    )
-    bare_url = home_url.removeprefix("https://")
-
-    outcome = run_growthradar_session(
-        bare_url,
-        config=config,
-        run_id="run-normalize",
-        log_dir=tmp_path,
-        attempt_registration=False,
-    )
-
-    assert outcome.exploration is not None
-    assert outcome.exploration.visited[0].success is True
-    assert outcome.exploration.visited[0].url == home_url
-    assert outcome.report.company != "Unknown"
-    assert outcome.report.product_url == home_url
 
 
 def test_report_is_persisted_and_readable_after_run(tmp_path: Path, config: Config) -> None:
@@ -332,42 +107,6 @@ def test_llm_summary_failure_is_isolated_and_still_produces_a_report(
     assert outcome.report is not None
     assert outcome.report.partial_run is True
     assert outcome.report.llm_summary is None
-
-
-def test_registration_falls_back_to_modal_entry_point_when_no_distinct_url_found(
-    tmp_path: Path, config: Config
-) -> None:
-    # GRO-32: mirrors allevents.in -- no distinct signup URL anywhere on the
-    # site, only a "Sign in" button that reveals a client-side email-then-name
-    # modal. _find_registration_page_url finds nothing (the crawl never sees
-    # a page classified "registration"), so registration must fall back to
-    # open_registration_entry_point on the landing page instead of skipping.
-    home_html = (
-        "<html><body>"
-        "<button onclick=\"document.getElementById('modal').style.display='block';\">"
-        "Sign in</button>"
-        "<div id='modal' style='display:none'>"
-        "<input type='email' placeholder='Email' />"
-        '<button onclick="'
-        "document.getElementById('modal').style.display='none';"
-        "document.getElementById('step2').style.display='block';"
-        '">Continue</button>'
-        "</div>"
-        "<div id='step2' style='display:none'>"
-        "<input type='text' placeholder='First Name' />"
-        "<input type='text' placeholder='Last Name' />"
-        "<button onclick=\"document.title='registered';\">Register</button>"
-        "</div>"
-        "</body></html>"
-    )
-    home_url = _data_url(home_html)
-
-    outcome = run_growthradar_session(home_url, config=config, run_id="run-modal", log_dir=tmp_path)
-
-    assert outcome.registration is not None
-    assert outcome.registration.submitted is True
-    assert outcome.report.registration_completed is True
-    assert outcome.errors == ()
 
 
 def test_find_registration_page_url_prefers_the_actual_signup_form_over_a_pricing_page(

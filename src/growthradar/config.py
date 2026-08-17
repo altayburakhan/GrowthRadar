@@ -131,7 +131,7 @@ class Config:
         try:
             return cls(
                 groq_api_key=_get_optional("GROQ_API_KEY"),
-                groq_model=_get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                groq_model=_get("GROQ_MODEL", "openai/gpt-oss-120b"),
                 # No default: unlike groq_model, Groq's vision-capable lineup
                 # has repeatedly churned (3.2-vision previews deprecated;
                 # account access varies), and a baked-in guess would silently
