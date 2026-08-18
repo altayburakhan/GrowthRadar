@@ -566,6 +566,7 @@ def _attempt_registration(
         country=config.registrant_country,
         company_name=config.registrant_company,
         email_override=config.registrant_email,
+        password_override=config.registrant_password,
         first_name_override=config.registrant_first_name,
         last_name_override=config.registrant_last_name,
         config=config,

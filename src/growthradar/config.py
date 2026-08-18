@@ -41,6 +41,15 @@ class Config:
     registrant_country: str
     registrant_company: str | None
     registrant_email: str | None
+    # Fixed rather than a fresh random one every run (identity.py's old
+    # default) -- a random password is deliberately never recorded anywhere
+    # (not in Evidence, not in a log), which also meant nobody could look up
+    # what a given run's account password actually was. A known constant
+    # makes every created account log-in-able later (see
+    # registration.attempt_login, or by hand) at the cost of every such
+    # account sharing one password -- acceptable here since these are
+    # disposable prospect-evaluation accounts, not real user accounts.
+    registrant_password: str
     registrant_first_name: str | None
     registrant_last_name: str | None
 
@@ -150,6 +159,10 @@ class Config:
                 registrant_country=_get("GROWTHRADAR_COUNTRY", "United States"),
                 registrant_company=_get_optional("GROWTHRADAR_COMPANY"),
                 registrant_email=_get_optional("GROWTHRADAR_EMAIL"),
+                # Not a real secret (see the field's own docstring above) --
+                # a plain, checked-in-safe default so the password is known
+                # even when GROWTHRADAR_PASSWORD is never set.
+                registrant_password=_get("GROWTHRADAR_PASSWORD", "GrowthRadar2026!"),
                 registrant_first_name=_get_optional("GROWTHRADAR_FIRST_NAME"),
                 registrant_last_name=_get_optional("GROWTHRADAR_LAST_NAME"),
                 gmail_address=_get_optional("GROWTHRADAR_GMAIL_ADDRESS"),

@@ -191,6 +191,7 @@ def generate_identity(
     *,
     email_domain: str = "example.com",
     email_override: str | None = None,
+    password_override: str | None = None,
     country: str = "United States",
     company_name: str | None = None,
     first_name: str | None = None,
@@ -203,6 +204,15 @@ def generate_identity(
     signup flow needs consistent, real values -- e.g. a full name typed into
     a "Full name" field should read as one real, chosen person, not a random
     one picked per run -- rather than a random name/company each time.
+
+    `password_override` (see `Config.registrant_password`) pins the password
+    too, same reasoning: a fresh random one every run (the old default) is
+    never recorded anywhere -- not in Evidence, not in a log -- specifically
+    so a secret never lands in the database or on disk, but that also means
+    nobody could ever look up what password a given run actually used to
+    manually check the created account. A known, fixed password makes every
+    run's account log-in-able after the fact, at the accepted cost that all
+    such accounts share one password.
     """
     first = first_name or random.choice(_FIRST_NAMES)
     last = last_name or random.choice(_LAST_NAMES)
@@ -212,7 +222,7 @@ def generate_identity(
         first_name=first,
         last_name=last,
         email=email,
-        password=generate_password(),
+        password=password_override or generate_password(),
         company_name=resolved_company_name,
         country=country,
         date_of_birth=_DEFAULT_DATE_OF_BIRTH,

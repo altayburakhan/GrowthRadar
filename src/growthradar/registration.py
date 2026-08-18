@@ -1589,6 +1589,7 @@ def run_registration(
     country: str = "United States",
     company_name: str | None = None,
     email_override: str | None = None,
+    password_override: str | None = None,
     first_name_override: str | None = None,
     last_name_override: str | None = None,
     config: Config | None = None,
@@ -1597,14 +1598,19 @@ def run_registration(
 ) -> RegistrationResult:
     """Fill and submit a (possibly multi-step) registration form. Never raises.
 
-    `country`/`company_name`/`email_override`/`first_name_override`/
-    `last_name_override` are only used when `identity` isn't supplied -- they
-    let a caller pin these values (see `Config.registrant_country` /
-    `Config.registrant_company` / `Config.registrant_email` /
+    `country`/`company_name`/`email_override`/`password_override`/
+    `first_name_override`/`last_name_override` are only used when `identity`
+    isn't supplied -- they let a caller pin these values (see
+    `Config.registrant_country` / `Config.registrant_company` /
+    `Config.registrant_email` / `Config.registrant_password` /
     `Config.registrant_first_name` / `Config.registrant_last_name`) instead of
-    getting a random name/company/email domain on every run. `email_override`
-    is used verbatim (see `identity._build_email`) -- every target site sees
-    the same real, monitored inbox, not a distinct variant per run.
+    getting a random name/company/email domain/password on every run.
+    `email_override` is used verbatim (see `identity._build_email`) -- every
+    target site sees the same real, monitored inbox, not a distinct variant
+    per run. `password_override` likewise (see `identity.generate_identity`)
+    -- a known, fixed password instead of one generated and then never
+    recorded anywhere, so a just-created account can actually be logged back
+    into later (see `attempt_login`) or by hand.
 
     `config` is only needed for the screenshot+vision-LLM fallback (see
     vision_fallback.py) -- omitted (the default), that fallback is simply
@@ -1624,6 +1630,7 @@ def run_registration(
         country=country,
         company_name=company_name,
         email_override=email_override,
+        password_override=password_override,
         first_name=first_name_override,
         last_name=last_name_override,
     )
