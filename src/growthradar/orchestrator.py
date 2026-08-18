@@ -63,6 +63,7 @@ from growthradar.history import RunHistoryStore, RunSummary
 from growthradar.llm_summary import record_llm_summary
 from growthradar.registration import (
     RegistrationResult,
+    attempt_login,
     open_registration_entry_point,
     run_registration,
 )
@@ -347,6 +348,14 @@ def _run_browser_phases(
                 run_logger.error(f"post-registration exploration failed: {exc}")
                 errors.append(f"post-registration exploration: {exc}")
 
+            if not (cancelled is not None and cancelled()):
+                try:
+                    _attempt_login_if_reached(session, store, run_logger, registration_result)
+                except Exception as exc:
+                    logger.exception("login attempt failed")
+                    run_logger.error(f"login attempt failed: {exc}")
+                    errors.append(f"login attempt: {exc}")
+
     return (
         exploration_result,
         registration_result,
@@ -410,6 +419,47 @@ def _explore_authenticated_app(
 def _signup_keyword_hits(e: Evidence) -> int:
     haystack = f"{e.label} {e.url}".lower().replace("-", " ").replace("_", " ")
     return sum(keyword in haystack for keyword in _SIGNUP_KEYWORDS)
+
+
+def _find_login_page_url(store: EvidenceStore, run_id: str) -> str | None:
+    for e in store.for_run(run_id):
+        if (
+            e.label.startswith("screenshot:")
+            and isinstance(e.visible_ui, dict)
+            and e.visible_ui.get("screenshot_kind") == "login"
+            and e.url
+        ):
+            return e.url
+    return None
+
+
+def _attempt_login_if_reached(
+    session: BrowserSession,
+    store: EvidenceStore,
+    run_logger: RunLogger,
+    registration_result: RegistrationResult,
+) -> None:
+    """If exploration (pre- or post-registration) landed on a page classified
+    as a login screen, actually try logging in with the identity that was
+    just used to register -- that's the one point in a run where a real
+    account with a known password exists (see registration.attempt_login).
+    Without this, a login page found mid-crawl was only ever screenshotted,
+    never interacted with (seen live on conceptboard.com's
+    /login-redirect)."""
+    login_url = _find_login_page_url(store, run_logger.run_id)
+    if login_url is None:
+        return
+
+    page = session.page
+    if page is None:
+        return
+    if page.url != login_url and not session.goto(login_url):
+        run_logger.error(f"could not navigate back to login page {login_url}")
+        return
+
+    run_logger.action("login_attempt_started", url=page.url)
+    logged_in = attempt_login(page, store, run_logger.run_id, registration_result.identity)
+    run_logger.action("login_attempt_finished", url=page.url, clicked=logged_in)
 
 
 def _find_registration_page_url(store: EvidenceStore, run_id: str) -> str | None:

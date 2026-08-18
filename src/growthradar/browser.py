@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -82,6 +81,45 @@ def wait_for_stable(page: Page, timeout: float = 10.0) -> None:
         page.wait_for_timeout(250)
 
 
+# Finds the first visible button/link/role=button whose trimmed text OR
+# aria-label case-insensitively exact-matches one of `texts`, entirely in
+# the page's own JS engine -- see dismiss_overlays below for why this
+# replaced 22 separate Locator.count() round trips (11 texts x
+# has_text-filter/aria-label-selector) per frame, most of which found
+# nothing on a page with no overlay at all.
+_OVERLAY_SCAN_JS = """
+(texts) => {
+    const wanted = new Set(texts.map((t) => t.trim().toLowerCase()));
+    const els = document.querySelectorAll('button, a, [role="button"]');
+    for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        const rawText = (el.innerText || el.textContent || '').trim();
+        const rawAria = (el.getAttribute('aria-label') || '').trim();
+        const matched = wanted.has(rawText.toLowerCase())
+            ? rawText
+            : wanted.has(rawAria.toLowerCase())
+                ? rawAria
+                : null;
+        if (matched === null) continue;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        if (rect.width > 0 && rect.height > 0
+            && style.visibility !== 'hidden' && style.display !== 'none') {
+            return {index: i, text: matched};
+        }
+    }
+    return null;
+}
+"""
+
+# A page can show more than one overlay in sequence (a cookie banner, then a
+# separate newsletter popup) -- dismiss_overlays keeps re-scanning a frame
+# after each successful click, bounded so a page that keeps regenerating a
+# "closeable" element (or two overlays that toggle each other back on) can't
+# loop forever.
+_MAX_OVERLAY_DISMISSALS_PER_FRAME = 5
+
+
 def dismiss_overlays(page: Page, timeout: float = 1.2) -> bool:
     """Best-effort dismissal of cookie banners / consent modals. Never raises.
 
@@ -95,30 +133,34 @@ def dismiss_overlays(page: Page, timeout: float = 1.2) -> bool:
     Also matches by aria-label, not just visible text: that same close
     control has no text at all, just an SVG icon behind
     `role="button" aria-label="Close"`.
+
+    A single batched `evaluate()` per scan (see _OVERLAY_SCAN_JS) instead of
+    a Locator.count() per text/pattern combination -- the latter cost ~7s a
+    call on a real, overlay-free page (seen live on web.hr/pricing) purely
+    from 22 round trips that all came back empty, and this function runs on
+    every navigation (browser.py's own goto()) plus every registration loop
+    iteration, so that cost was paid over and over for the entire run.
     """
     dismissed_any = False
     timeout_ms = timeout * 1000
+    texts = list(_OVERLAY_BUTTON_TEXTS)
     for frame in page.frames:
-        for text in _OVERLAY_BUTTON_TEXTS:
-            escaped = re.escape(text)
-            pattern = re.compile(rf"^\s*{escaped}\s*$", re.IGNORECASE)
-            candidates = (
-                frame.locator('button, a, [role="button"]').filter(has_text=pattern),
-                frame.locator(
-                    f'button[aria-label="{text}" i], a[aria-label="{text}" i], '
-                    f'[role="button"][aria-label="{text}" i]'
-                ),
-            )
-            for locator in candidates:
-                try:
-                    if locator.count() == 0:
-                        continue
-                    locator.first.click(timeout=timeout_ms)
-                    dismissed_any = True
-                    logger.info("dismissed overlay via button text=%r on %s", text, frame.url)
-                    page.wait_for_timeout(150)
-                except (PlaywrightTimeoutError, PlaywrightError):
-                    continue
+        for _ in range(_MAX_OVERLAY_DISMISSALS_PER_FRAME):
+            try:
+                match = frame.evaluate(_OVERLAY_SCAN_JS, texts)
+            except PlaywrightError:
+                break
+            if match is None:
+                break
+            try:
+                frame.locator('button, a, [role="button"]').nth(match["index"]).click(
+                    timeout=timeout_ms
+                )
+            except (PlaywrightTimeoutError, PlaywrightError):
+                break
+            dismissed_any = True
+            logger.info("dismissed overlay via button text=%r on %s", match["text"], frame.url)
+            page.wait_for_timeout(150)
     return dismissed_any
 
 

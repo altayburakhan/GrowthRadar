@@ -1,9 +1,9 @@
 """JavaScript and network inspection: detects known onboarding/product-adoption
 tools (UserGuiding, Pendo, Appcues, WalkMe, Chameleon, Product Fruits, Userpilot,
-Whatfix, Userflow, Intercom, Shepherd, Intro.js, Driver.js), general analytics/tracking
+Whatfix, Userflow, Shepherd, Intro.js, Driver.js), general analytics/tracking
 providers (Google
 Analytics, Segment, Mixpanel, Amplitude, Hotjar, FullStory -- GRO-28), *and*
-AI chat/assistant widgets (Drift, Zendesk Chat, Ada, Crisp, Tidio, LiveChat,
+AI chat/assistant widgets (Intercom, Drift, Zendesk Chat, Ada, Crisp, Tidio, LiveChat,
 HubSpot Chat, Freshchat, Tawk.to) by combining multiple independent signals --
 script URLs, window globals, and observed network requests -- rather than a
 single name match. Reads passively from BrowserSession.requests (GRO-6),
@@ -84,7 +84,6 @@ _ONBOARDING_TOOLS: tuple[ToolSignature, ...] = (
     ),
     ToolSignature("Whatfix", ("whatfix.com",), ("Whatfix", "_wfx_environment")),
     ToolSignature("Userflow", ("js.userflow.com",), ("userflow", "Userflow")),
-    ToolSignature("Intercom", ("intercom.io", "intercomcdn.com"), ("Intercom", "intercomSettings")),
     ToolSignature("Shepherd", ("shepherdjs.dev", "shepherd.js"), ("Shepherd",)),
     ToolSignature("Intro.js", ("introjs.com", "intro.js"), ("introJs",)),
     ToolSignature(
@@ -135,6 +134,20 @@ _ANALYTICS_TOOLS: tuple[ToolSignature, ...] = (
 # Informational only -- see module docstring: presence, not confirmed-AI,
 # and excluded from onboarding scoring same as _ANALYTICS_TOOLS.
 _AI_ASSISTANT_TOOLS: tuple[ToolSignature, ...] = (
+    # Intercom's core product is customer messaging/support chat, not a
+    # UserGuiding-style product tour/checklist tool -- it was previously
+    # miscategorized under _ONBOARDING_TOOLS, which made scoring.py treat
+    # every Intercom-using site (an extremely common live-chat widget,
+    # unrelated to onboarding-tool budget) as having a "competitor onboarding
+    # tool", and report.py/the dashboard would list it as a "Rakip araç" even
+    # on runs where the same site was flagged as an existing UserGuiding
+    # customer (seen live on 17hats.com).
+    ToolSignature(
+        "Intercom",
+        ("intercom.io", "intercomcdn.com"),
+        ("Intercom", "intercomSettings"),
+        category=ToolCategory.AI_ASSISTANT,
+    ),
     ToolSignature(
         "Drift",
         ("js.driftt.com", "js.drift.com"),

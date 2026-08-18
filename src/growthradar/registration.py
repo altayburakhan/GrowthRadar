@@ -16,6 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Any
 from urllib.parse import urljoin
 
 from patchright.sync_api import Error as PlaywrightError
@@ -116,6 +117,7 @@ _SUBMIT_BUTTON_TEXTS: tuple[str, ...] = (
     "Sign up",
     "Create account",
     "Get started",
+    "Start trial",
     "Start free trial",
     "Register",
     "Submit",
@@ -570,19 +572,6 @@ def _check_consent_checkboxes(frame: Frame) -> int:
     return checked
 
 
-def _clickable_text(locator: Locator) -> str:
-    try:
-        text = locator.inner_text(timeout=500)
-        if text.strip():
-            return text
-    except PlaywrightError:
-        pass
-    try:
-        return f"{locator.get_attribute('value') or ''} {locator.get_attribute('aria-label') or ''}"
-    except PlaywrightError:
-        return ""
-
-
 def _words(text: str) -> set[str]:
     return {w for w in text.lower().split() if w}
 
@@ -611,15 +600,85 @@ def _is_oauth_text(lowered: str, *, allow_google: bool = False) -> bool:
     return bool(_OAUTH_PHRASE_RE.search(lowered)) and "email" not in lowered
 
 
-def _is_oauth_button(locator: Locator, *, allow_google: bool = False) -> bool:
-    return _is_oauth_text(_clickable_text(locator).lower(), allow_google=allow_google)
-
-
 # Reuses exploration.py's _SIGNUP_KEYWORDS (imported above) so "what counts as
 # a signup CTA" is defined in exactly one place.
 _LOGIN_KEYWORDS: tuple[str, ...] = ("log in", "login", "sign in")
 
 _CLICKABLE_SELECTOR = 'button, a, [role="button"]'
+
+
+@dataclass(frozen=True)
+class _ClickCandidate:
+    """One clickable element's already-fetched text/visibility/claimed/href
+    -- everything every click-matching function below needs, without going
+    back to the browser per candidate."""
+
+    index: int
+    text: str
+    visible: bool
+    claimed: bool
+    href: str | None
+
+
+# Combines what used to be several separate per-candidate Playwright calls
+# (.is_visible(), .get_attribute(claimed marker), .inner_text()/.get_attribute
+# fallback for text, .get_attribute('href')) into the fields every caller
+# below needs, computed entirely in the page's own JS engine.
+_CANDIDATE_SCAN_JS = f"""
+(els) => els.map((el) => {{
+    const style = getComputedStyle(el);
+    const visible = style.visibility !== 'hidden' && style.display !== 'none'
+        && el.getClientRects().length > 0;
+    const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    return {{
+        visible,
+        text,
+        claimed: el.hasAttribute('{_CLAIMED_MARKER}'),
+        href: el.getAttribute('href'),
+    }};
+}})
+"""
+
+
+def _scan_clickable(scope: Frame | Page, selector: str) -> tuple[Locator, list[_ClickCandidate]]:
+    """One `evaluate_all()` round trip for every element matching `selector`,
+    instead of a separate Playwright call per candidate per caller.
+
+    The functions below each used to call .is_visible()/.get_attribute()/
+    .inner_text() (the latter with its own up-to-500ms actionability wait)
+    once per candidate, and _click_submit did that *again* for every one of
+    its ~8 target phrases -- fine on a small form, but O(button_texts *
+    candidates) round trips stalls for tens of seconds to minutes on a
+    content-heavy page (seen live on web.hr/pricing: ~80 buttons/links/FAQ-
+    toggles alongside the two real signup buttons burned almost the entire
+    180s registration budget on scanning alone, never reaching a real click).
+    mirro.io's 188-link landing page did the same to _find_clickable_by_
+    keywords even after an earlier partial fix (_fast_visible_text) cut it
+    to one round trip per candidate -- still O(candidates), just with a
+    smaller constant.
+
+    The returned Locator is the same live `selector` query -- `.nth(index)`
+    re-resolves fresh against the current DOM at click time, so this is
+    never any *more* stale than the per-candidate approach it replaces (if
+    anything, less: the whole scan now takes one round trip instead of
+    however many seconds/minutes the old version spent between the first
+    candidate check and the eventual click).
+    """
+    candidates = scope.locator(selector)
+    try:
+        raw: list[dict[str, Any]] = candidates.evaluate_all(_CANDIDATE_SCAN_JS)
+    except PlaywrightError:
+        return candidates, []
+    return candidates, [
+        _ClickCandidate(
+            index=i,
+            text=str(item.get("text") or ""),
+            visible=bool(item.get("visible")),
+            claimed=bool(item.get("claimed")),
+            href=item.get("href"),
+        )
+        for i, item in enumerate(raw)
+    ]
 
 
 def _click_submit(
@@ -636,29 +695,22 @@ def _click_submit(
     # inserts a word into "Start free trial". Word-subset matching below
     # (every word of our phrase present, in any order/position) is more
     # forgiving without being so loose it clicks unrelated buttons.
-    try:
-        candidates = frame.locator(
-            'button, a, input[type="submit"], input[type="button"], [role="button"]'
-        )
-        count = candidates.count()
-    except PlaywrightError:
-        return False
+    candidates, infos = _scan_clickable(
+        frame, 'button, a, input[type="submit"], input[type="button"], [role="button"]'
+    )
 
     for text in button_texts:
         target_words = _words(text)
-        for i in range(count):
-            candidate = candidates.nth(i)
-            try:
-                if not candidate.is_visible():
-                    continue
-                if _is_claimed(candidate) and not allow_reclaim:
-                    continue
-            except PlaywrightError:
+        for info in infos:
+            if not info.visible:
                 continue
-            if not target_words <= _words(_clickable_text(candidate)):
+            if info.claimed and not allow_reclaim:
                 continue
-            if _is_oauth_button(candidate, allow_google=allow_google_oauth):
+            if not target_words <= _words(info.text):
                 continue
+            if _is_oauth_text(info.text.lower(), allow_google=allow_google_oauth):
+                continue
+            candidate = candidates.nth(info.index)
             try:
                 candidate.click(timeout=3000)
             except PlaywrightError:
@@ -716,7 +768,17 @@ _CHOICE_EXCLUDE_KEYWORDS: tuple[str, ...] = (
     "license agreement",
     "cookie policy",
     *_LOGIN_KEYWORDS,
-    *_SIGNUP_KEYWORDS,
+    # Deliberately NOT *_SIGNUP_KEYWORDS: a real primary signup CTA living in
+    # the page body rather than <nav>/<header> (so _CHOICE_CLICKABLE_SELECTOR's
+    # own nav/header/footer exclusion doesn't already catch it) almost always
+    # *is* signup-flavored text ("Sign Up on yearly plan and save", "Free
+    # Sign Up") -- excluding it here made the `best` bucket below (submit-like
+    # AND signup-flavored, meant to be the top pick) permanently unreachable,
+    # so this fell through to clicking the first unrelated eligible element
+    # instead (seen live on web.hr/pricing: clicked a "Payroll" module-price
+    # toggle, then the next FAQ accordion, etc., one per iteration, never the
+    # two real "Sign Up" buttons two rows above them -- registration never
+    # progressed past this page at all).
 )
 # :is(...) wraps the comma-separated _CLICKABLE_SELECTOR into one compound
 # selector so :not() excludes nav/header/footer descendants from all three
@@ -804,21 +866,13 @@ def _is_continue_with_email(text: str) -> bool:
 
 
 def _click_continue_with_email(frame: Frame) -> bool:
-    try:
-        candidates = frame.locator(_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return False
-
-    for i in range(count):
-        candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible() or _is_claimed(candidate):
-                continue
-        except PlaywrightError:
+    candidates, infos = _scan_clickable(frame, _CLICKABLE_SELECTOR)
+    for info in infos:
+        if not info.visible or info.claimed:
             continue
-        if not _is_continue_with_email(_clickable_text(candidate).strip()):
+        if not _is_continue_with_email(info.text.strip()):
             continue
+        candidate = candidates.nth(info.index)
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -856,21 +910,13 @@ def _is_skip_prompt(text: str) -> bool:
 
 
 def _click_skip_prompt(frame: Frame) -> bool:
-    try:
-        candidates = frame.locator(_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return False
-
-    for i in range(count):
-        candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible() or _is_claimed(candidate):
-                continue
-        except PlaywrightError:
+    candidates, infos = _scan_clickable(frame, _CLICKABLE_SELECTOR)
+    for info in infos:
+        if not info.visible or info.claimed:
             continue
-        if not _is_skip_prompt(_clickable_text(candidate).strip()):
+        if not _is_skip_prompt(info.text.strip()):
             continue
+        candidate = candidates.nth(info.index)
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -880,11 +926,11 @@ def _click_skip_prompt(frame: Frame) -> bool:
     return False
 
 
-def _is_google_oauth_candidate(locator: Locator) -> bool:
-    # Same "names Google and only Google" test _is_oauth_button uses to
+def _is_google_oauth_candidate(text: str) -> bool:
+    # Same "names Google and only Google" test _is_oauth_text uses to
     # decide whether to stop excluding a button -- factored out so the
     # priority click below and the exclusion check agree on what counts.
-    lowered = _clickable_text(locator).lower()
+    lowered = text.lower()
     matched_providers = [keyword for keyword in _OAUTH_BUTTON_KEYWORDS if keyword in lowered]
     return matched_providers == ["google"]
 
@@ -905,21 +951,13 @@ def _click_google_oauth_button(frame: Frame) -> bool:
     dead-ends on a verification code sent to a fake inbox, so this has to
     run before the fill step, not compete with it.
     """
-    try:
-        candidates = frame.locator(_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return False
-
-    for i in range(count):
-        candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible() or _is_claimed(candidate):
-                continue
-        except PlaywrightError:
+    candidates, infos = _scan_clickable(frame, _CLICKABLE_SELECTOR)
+    for info in infos:
+        if not info.visible or info.claimed:
             continue
-        if not _is_google_oauth_candidate(candidate):
+        if not _is_google_oauth_candidate(info.text):
             continue
+        candidate = candidates.nth(info.index)
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -1009,7 +1047,7 @@ def _fill_verification_code(page: Page, code: str) -> bool:
     return False
 
 
-def _is_offsite_link(candidate: Locator, page_url: str) -> bool:
+def _is_offsite_href(href: str | None, page_url: str) -> bool:
     """True for an `<a href>` pointing off the current site entirely (a
     different registrable domain, not just a different path/subdomain --
     see exploration.py's _in_scope, which already treats a same-site
@@ -1023,10 +1061,6 @@ def _is_offsite_link(candidate: Locator, page_url: str) -> bool:
     choice-picker clicked it first, landing on an unrelated HubSpot-hosted
     resource page instead of ever reaching a signup flow.
     """
-    try:
-        href = candidate.get_attribute("href")
-    except PlaywrightError:
-        return False
     if not href:
         return False
     try:
@@ -1047,14 +1081,10 @@ def _is_signup_flavored(text: str) -> bool:
 
 
 def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = False) -> bool:
-    try:
-        candidates = page.locator(_CHOICE_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return False
+    candidates, infos = _scan_clickable(page, _CHOICE_CLICKABLE_SELECTOR)
 
     page_url = page.url
-    eligible: list[tuple[Locator, str]] = []
+    eligible: list[tuple[int, str]] = []
     # Submit-like AND signup-flavored (e.g. kamiapp.com's "Create a free
     # account", which matches _SUBMIT_BUTTON_TEXTS' "Create account" via
     # word-subset) is unambiguously the best possible pick -- always
@@ -1065,19 +1095,15 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
     # function and _click_submit never both click within the same
     # iteration, to avoid clicking two different cards -- seen live on an
     # earlier kamiapp.com regression).
-    best: list[tuple[Locator, str]] = []
-    for i in range(count):
-        candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible() or _is_claimed(candidate):
-                continue
-        except PlaywrightError:
+    best: list[tuple[int, str]] = []
+    for info in infos:
+        if not info.visible or info.claimed:
             continue
-        text = _clickable_text(candidate).strip()
+        text = info.text.strip()
         if not text:
             continue
         lowered = text.lower()
-        if _is_oauth_button(candidate, allow_google=allow_google_oauth):
+        if _is_oauth_text(lowered, allow_google=allow_google_oauth):
             continue
         if any(keyword in lowered for keyword in _CHOICE_EXCLUDE_KEYWORDS):
             continue
@@ -1090,13 +1116,13 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
         # exists to catch genuinely unrelated content links like the
         # "Learning Hub" banner, not to second-guess text that already
         # reads as a clear signup CTA.
-        if not signup_flavored and _is_offsite_link(candidate, page_url):
+        if not signup_flavored and _is_offsite_href(info.href, page_url):
             continue
         if _is_submit_like(lowered):
             if signup_flavored:
-                best.append((candidate, text))
+                best.append((info.index, text))
             continue
-        eligible.append((candidate, text))
+        eligible.append((info.index, text))
 
     # Among the rest, a signup/trial-flavored option (seen live on
     # kamiapp.com: "Book a 30-day trial") still beats whatever happens to
@@ -1105,7 +1131,8 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
     # either). sorted() is stable, so this only reorders when a
     # signup-flavored option actually exists among `eligible`.
     ordered = best + sorted(eligible, key=lambda pair: not _is_signup_flavored(pair[1]))
-    for candidate, _text in ordered:
+    for index, _text in ordered:
+        candidate = candidates.nth(index)
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -1120,7 +1147,7 @@ def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = Fal
 # see registration_blocked_by_captcha below. Its own controls are invisible
 # to a plain page.locator() (Playwright doesn't reach into cross-origin
 # iframes), but the underlying page's own buttons behind/around the overlay
-# -- including OAuth/integration buttons _is_oauth_button would otherwise
+# -- including OAuth/integration buttons _is_oauth_text would otherwise
 # exclude -- stay in the DOM and register as "visible" even though a human
 # couldn't actually click most of them. Without this check, the choice-
 # wizard/vision fallback below can find and click one of those instead (seen
@@ -1271,20 +1298,13 @@ def _click_by_exact_text(page: Page, text: str) -> bool:
     stays a separate, stricter match than _click_unclaimed_choice_option's
     first-available heuristic: vision was shown a specific set of options and
     picked one, so we click exactly that one, not merely "the first"."""
-    try:
-        candidates = page.locator(_CHOICE_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return False
-    for i in range(count):
-        candidate = candidates.nth(i)
-        try:
-            if not candidate.is_visible() or _is_claimed(candidate):
-                continue
-            if _clickable_text(candidate).strip() != text:
-                continue
-        except PlaywrightError:
+    candidates, infos = _scan_clickable(page, _CHOICE_CLICKABLE_SELECTOR)
+    for info in infos:
+        if not info.visible or info.claimed:
             continue
+        if info.text.strip() != text:
+            continue
+        candidate = candidates.nth(info.index)
         try:
             candidate.click(timeout=3000)
         except PlaywrightError:
@@ -1312,52 +1332,21 @@ def _visible_credential_field_count(page: Page) -> int:
     return visible
 
 
-_FAST_VISIBLE_TEXT_JS = """el => {
-    const style = getComputedStyle(el);
-    const visible = style.visibility !== 'hidden' && style.display !== 'none'
-        && el.getClientRects().length > 0;
-    const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
-    return [visible, text];
-}"""
-
-
-def _fast_visible_text(candidate: Locator) -> tuple[bool, str]:
-    """One JS round-trip in place of _clickable_text's `.inner_text(timeout=500)`
-    plus a separate `.is_visible()` call -- each of those carries its own
-    Playwright actionability-wait overhead per call, which is fine for a
-    single element but not for scanning every clickable element on a page
-    one at a time (see _find_clickable_by_keywords, the only caller: a
-    link-heavy marketing page -- 188 candidates on mirro.io's landing page
-    -- made one search take well over a minute this way, even when nothing
-    ultimately matched)."""
-    try:
-        visible, text = candidate.evaluate(_FAST_VISIBLE_TEXT_JS)
-        return bool(visible), str(text)
-    except PlaywrightError:
-        return False, ""
-
-
 def _find_clickable_by_keywords(page: Page, keywords: tuple[str, ...]) -> Locator | None:
     # Substring matching (not _click_submit's word-subset matching) --
     # consistent with how exploration.py already matches these same keyword
     # lists against link text; these are short, generic phrases ("sign up",
     # "login") where a plain substring check is enough and keeps this in
     # sync with the crawler's own notion of "a signup/login control".
-    try:
-        candidates = page.locator(_CLICKABLE_SELECTOR)
-        count = candidates.count()
-    except PlaywrightError:
-        return None
-    for i in range(count):
-        candidate = candidates.nth(i)
-        visible, text = _fast_visible_text(candidate)
-        if not visible or not text:
+    candidates, infos = _scan_clickable(page, _CLICKABLE_SELECTOR)
+    for info in infos:
+        if not info.visible or not info.text:
             continue
-        lowered = text.lower()
+        lowered = info.text.lower()
         if _is_oauth_text(lowered):
             continue
         if any(keyword in lowered for keyword in keywords):
-            return candidate
+            return candidates.nth(info.index)
     return None
 
 
@@ -1519,6 +1508,74 @@ def _switch_to_new_page(page: Page, pages_before: int, store: EvidenceStore, run
         new_page, store, run_id, ScreenshotKind.REGISTRATION, "registration opened a new tab"
     )
     return new_page
+
+
+# Deliberately not folded into _SUBMIT_BUTTON_TEXTS: a login form's button
+# almost never says "Sign up"/"Register"/"Start trial" (those would be the
+# *wrong* action here), and conversely a signup form's submit shouldn't match
+# "Log in"/"Sign in" either -- the two flows need disjoint phrase lists so
+# _click_submit's word-subset matching can't cross-click the wrong one.
+# "Next" is required, not optional: a same-origin email-first login (email
+# screen -> "Next" -> separate password screen, seen live on
+# conceptboard.com) is exactly as common as a single-page login form, and
+# without it the email gets filled but the click that would reveal the
+# password field never happens.
+_LOGIN_BUTTON_TEXTS: tuple[str, ...] = ("Log in", "Login", "Sign in", "Next", "Continue", "Submit")
+# A login flow is short by nature (email screen, password screen, maybe a
+# "stay signed in?" prompt) -- a small bound catches the common 1-3 screen
+# cases without risking the same runaway-loop shape registration.py's own
+# MAX_FORM_STEPS guards against.
+_MAX_LOGIN_STEPS = 4
+
+
+def attempt_login(page: Page, store: EvidenceStore, run_id: str, identity: Identity) -> bool:
+    """Fill and submit whatever login form is visible on `page` with
+    `identity`'s email/password, following an email-then-password style
+    multi-step flow the same way run_registration follows a multi-step
+    signup (see _LOGIN_BUTTON_TEXTS' "Next").
+
+    Only meaningful right after a successful `run_registration` with this
+    same `identity` -- that's the one case where the account genuinely
+    exists and the password is known, since it's never read back from
+    anywhere (not even the target site's own confirmation email). Used by
+    orchestrator.py when the post-registration crawl lands on a login page
+    (seen live on conceptboard.com: exploration visited
+    app.conceptboard.com/login-redirect after signup and, since nothing
+    called this, left it as a blank, never-interacted-with screenshot).
+
+    Never raises; records the attempt as its own Evidence row regardless of
+    outcome (Linear.md "Evidence first"), mirroring run_registration's own
+    "registration attempt". Returns whether at least one login-button click
+    actually happened -- not proof the login itself succeeded, since a wrong
+    password/rejected account looks identical from here (still on some page
+    with a clicked button); the caller's own next screenshot/DOM evidence is
+    what shows whether it actually worked.
+    """
+    total_filled = 0
+    logged_in = False
+    for _ in range(_MAX_LOGIN_STEPS):
+        dismiss_overlays(page)
+        filled = _fill_across_frames(page, lambda f: _fill_visible_fields(f, identity))
+        total_filled += filled
+        clicked = _click_across_frames(
+            page,
+            partial(_click_submit, allow_reclaim=filled > 0, button_texts=_LOGIN_BUTTON_TEXTS),
+        )
+        if not clicked:
+            break
+        wait_for_stable(page)
+        logged_in = True
+
+    if logged_in:
+        capture_and_record(page, store, run_id, ScreenshotKind.LOGIN, "login attempt result")
+
+    store.add(
+        run_id,
+        "login attempt",
+        url=page.url,
+        visible_ui={"email": identity.email, "fields_filled": total_filled, "clicked": logged_in},
+    )
+    return logged_in
 
 
 def run_registration(

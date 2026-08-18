@@ -55,7 +55,7 @@ class Config:
 
     # Reuse a persistent, already-authenticated Google Chrome profile so
     # "Continue with Google" buttons can be clicked instead of skipped (see
-    # registration.py's _is_oauth_button). The login itself is never
+    # registration.py's _is_oauth_text). The login itself is never
     # scripted here -- Google's 2FA/verification challenges need a real
     # human once, out of band (see scripts/google_profile_bootstrap.py) --
     # this only points the browser at a profile directory that's already
