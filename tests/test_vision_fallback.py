@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from growthradar.config import Config
-from growthradar.vision_fallback import _parse_choice, describe_screenshot
+from growthradar.vision_fallback import _parse_choice, _parse_field_values, describe_screenshot
 
 
 @pytest.fixture
@@ -55,6 +55,29 @@ def test_parse_choice_rejects_hallucinated_option_not_in_candidates() -> None:
 
 def test_parse_choice_returns_none_for_unparseable_content() -> None:
     assert _parse_choice("I cannot help with that.", ["Companies", "Advisors"]) is None
+
+
+def test_parse_field_values_maps_numbered_keys_to_zero_based_index() -> None:
+    content = '{"1": "Marketing Manager", "2": "10-50"}'
+    assert _parse_field_values(content, 2) == {0: "Marketing Manager", 1: "10-50"}
+
+
+def test_parse_field_values_strips_think_block() -> None:
+    content = '<think>picking values</think>\n{"1": "Founder"}'
+    assert _parse_field_values(content, 1) == {0: "Founder"}
+
+
+def test_parse_field_values_drops_out_of_range_and_empty_entries() -> None:
+    content = '{"1": "Founder", "2": "", "5": "out of range"}'
+    assert _parse_field_values(content, 2) == {0: "Founder"}
+
+
+def test_parse_field_values_returns_none_for_unparseable_content() -> None:
+    assert _parse_field_values("I cannot help with that.", 2) is None
+
+
+def test_parse_field_values_returns_none_when_all_entries_invalid() -> None:
+    assert _parse_field_values('{"1": ""}', 1) is None
 
 
 def test_describe_screenshot_returns_description(

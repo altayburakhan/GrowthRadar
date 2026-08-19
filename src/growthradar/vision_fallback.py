@@ -1,4 +1,4 @@
-"""Vision-LLM helpers built on `Config.groq_vision_model`, used in two
+"""Vision-LLM helpers built on `Config.groq_vision_model`, used in three
 unrelated places:
 
 1. `suggest_click_target` -- a registration-step fallback (registration.py)
@@ -11,17 +11,28 @@ unrelated places:
    ever narrows among candidates the DOM already found; it never concludes
    or acts alone (Linear.md "never conclude from one signal").
 
-2. `describe_screenshot` -- a one-sentence visual observation of an
+2. `suggest_field_values` -- a registration-step fallback for when real
+   fillable `<input>`/`<textarea>` elements exist but none matched
+   `_FIELD_PATTERNS`' fixed keyword lists (an oddly-labelled or fully custom
+   field -- "What's your team's goal?", a numeric "Team size", ...). Unlike
+   `suggest_click_target`, the model's answer isn't constrained to a fixed
+   candidate list -- there's no "real" answer to a signup form's free-text
+   fields, so any short, plausible-looking value is acceptable. Still never
+   invents which *elements* exist: the caller passes in the exact fields a
+   DOM scan already found (registration.py's `_unclaimed_visible_inputs`),
+   keyed by position, and only ever fills through those same locators.
+
+3. `describe_screenshot` -- a one-sentence visual observation of an
    already-saved screenshot file (llm_summary.py), purely to enrich its
    plain-English narrative. Never touches scoring: `scoring.py`'s verdict
    stays 100% rule-based regardless of what this returns, same guarantee
    `llm_summary.py` already gives its text-only facts.
 
-Both skip -- logged, never raised -- when no vision model is configured
-(`Config.groq_vision_model` unset) or the request/parse fails for any
-reason. Same isolation pattern as llm_summary.py's Groq call, and the same
-reason it's opt-in with no default model: Groq's vision-capable lineup has
-repeatedly changed (3.2-vision previews deprecated) and account access
+All three skip -- logged, never raised -- when no vision model is
+configured (`Config.groq_vision_model` unset) or the request/parse fails for
+any reason. Same isolation pattern as llm_summary.py's Groq call, and the
+same reason it's opt-in with no default model: Groq's vision-capable lineup
+has repeatedly changed (3.2-vision previews deprecated) and account access
 varies -- verify a model actually accepts image input on your key before
 setting GROQ_VISION_MODEL.
 """
@@ -78,6 +89,19 @@ DEFAULT_CANDIDATE_SELECTOR = 'button, a, [role="button"]'
 # module) and had no such filter, so a stuck step could still have the model
 # pick a demo-booking button off the screenshot.
 _EXCLUDED_CANDIDATE_KEYWORDS: tuple[str, ...] = ("demo",)
+
+_FILL_PROMPT_TEMPLATE = """You are looking at a screenshot of a signup/registration form on a \
+website. Below is a numbered list of empty input fields found on the page, identified by their \
+name/label/placeholder text. For each one, suggest a short, plausible, realistic-looking value a \
+real person signing up might type -- e.g. a job title, a team size number, a one-line use-case \
+description. Respond with ONLY a JSON object mapping each field's number (as a string) to a \
+suggested value, e.g. {{"1": "Marketing Manager", "2": "10-50"}}. Include an entry for every \
+numbered field below.
+
+Fields:
+{fields}"""
+
+_MAX_FIELD_HINT_LEN = 80
 
 _DESCRIBE_PROMPT_TEMPLATE = """This is a screenshot of a SaaS product's {page_kind} screen, \
 captured during an automated evaluation for a sales-prospecting tool. In ONE short, concrete \
@@ -222,6 +246,66 @@ def suggest_click_target(
 
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
     return _call_groq_vision(image_b64, candidates, config)
+
+
+def _parse_field_values(content: str, field_count: int) -> dict[int, str] | None:
+    cleaned = _THINK_BLOCK_RE.sub("", content).strip()
+    match = _JSON_OBJECT_RE.search(cleaned)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    result: dict[int, str] = {}
+    for key, value in parsed.items():
+        try:
+            index = int(key) - 1
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= index < field_count):
+            continue
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        text = str(value).strip()
+        if text:
+            result[index] = text
+    return result or None
+
+
+def suggest_field_values(page: Page, config: Config, hints: list[str]) -> dict[int, str] | None:
+    """Ask a vision-capable Groq model to suggest a plausible value for each
+    of `hints` (each an empty field's name/id/placeholder/label text -- see
+    registration.py's `_input_hint_text`), from a screenshot of the current
+    viewport. Returns a dict keyed by each field's 0-based position in
+    `hints` (not the hint text itself, which can be long/duplicated/messy)
+    mapping to a suggested value -- values may be freely invented (unlike
+    `suggest_click_target`, there's no "real" answer to a signup form's
+    free-text fields). None if unavailable, `hints` is empty, or the
+    request/parse fails. Never raises.
+    """
+    if not config.groq_vision_model or not config.groq_api_key:
+        return None
+    if not hints:
+        return None
+
+    try:
+        image_bytes = page.screenshot(full_page=False)
+    except PlaywrightError as exc:
+        logger.warning("vision fill fallback: screenshot failed: %s", exc)
+        return None
+
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    truncated = [h[:_MAX_FIELD_HINT_LEN] or f"field {i + 1}" for i, h in enumerate(hints)]
+    numbered = "\n".join(f"{i + 1}. {h}" for i, h in enumerate(truncated))
+    prompt = _FILL_PROMPT_TEMPLATE.format(fields=numbered)
+    content = _call_groq_vision_raw(image_b64, prompt, config)
+    if content is None:
+        return None
+    return _parse_field_values(content, len(hints))
 
 
 def describe_screenshot(image_path: str, page_kind: str, config: Config) -> str | None:

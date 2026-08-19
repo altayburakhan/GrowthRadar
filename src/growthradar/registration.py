@@ -30,7 +30,7 @@ from growthradar.exploration import _SIGNUP_KEYWORDS, _in_scope
 from growthradar.identity import Identity, generate_identity
 from growthradar.screenshot import ScreenshotKind, capture_and_record
 from growthradar.temp_email import TempEmailProvider, TempInbox
-from growthradar.vision_fallback import suggest_click_target
+from growthradar.vision_fallback import suggest_click_target, suggest_field_values
 
 logger = logging.getLogger(__name__)
 
@@ -1080,6 +1080,89 @@ def _is_signup_flavored(text: str) -> bool:
     return any(_words(keyword) <= candidate_words for keyword in _SIGNUP_KEYWORDS)
 
 
+def _radio_option_text(radio: Locator) -> str:
+    try:
+        return str(
+            radio.evaluate(
+                "el => (el.closest('label')?.innerText"
+                " || (el.labels && el.labels[0] && el.labels[0].innerText)"
+                " || el.getAttribute('aria-label') || '').trim()"
+            )
+        )
+    except PlaywrightError:
+        return ""
+
+
+def _check_unclaimed_radio_option(frame: Frame) -> bool:
+    """Select the first selectable, unclaimed, visible radio-group option in
+    DOM order -- e.g. doxy.me's "I'm a provider" / "I'm a patient" MUI
+    `<div role="radiogroup">` picker, gating an otherwise-disabled "Continue"
+    button. None of _fill_visible_fields (text inputs only),
+    _check_consent_checkboxes (checkboxes only), or
+    _click_unclaimed_choice_option (button/a/[role="button"] only) match a
+    native `<input type="radio">`, so a radiogroup-only step was previously
+    invisible to every fallback: nothing filled, nothing clicked, submitted
+    stayed False forever. Same "first-unexcluded-in-DOM-order" heuristic as
+    the button/link choice-picker: real signup wizards consistently list the
+    self-serve path first (seen live on doxy.me: "I'm a provider" -- the
+    account-creation path -- precedes "I'm a patient" -- a dead end, no
+    account at all). Deliberately dispatched per-frame like the fill
+    functions above, not page-only like _click_unclaimed_choice_option: an
+    embedded third-party form (see _fill_across_frames' iframe note) can use
+    this exact pattern too."""
+    try:
+        radios = frame.locator('input[type="radio"]')
+        count = radios.count()
+    except PlaywrightError:
+        return False
+
+    for i in range(count):
+        radio = radios.nth(i)
+        try:
+            if not radio.is_visible() or _is_claimed(radio):
+                continue
+            group_resolved = radio.evaluate(
+                "el => !!el.name && Array.prototype.some.call("
+                "document.getElementsByName(el.name),"
+                "r => r.type === 'radio' && r.checked)"
+            )
+        except PlaywrightError:
+            continue
+        if group_resolved:
+            # Some other option in this same named group is already
+            # selected -- by an earlier pick this function made, or a
+            # site-provided default -- so claim this one too rather than
+            # leaving it eligible. Without this, the *next* iteration's
+            # scan finds this still-unclaimed sibling and clicks it,
+            # silently flipping the group's answer (seen live on doxy.me:
+            # having already picked "I'm a provider", the next iteration
+            # found the still-unclaimed "I'm a patient" input right next to
+            # it and clicked that instead, switching away from the
+            # account-creation path to the dead-end "no account needed"
+            # one -- the loop never reached a stable answer and burned its
+            # entire step budget bouncing on this one screen).
+            _claim(radio)
+            continue
+        lowered = _radio_option_text(radio).lower()
+        if any(keyword in lowered for keyword in _CHOICE_EXCLUDE_KEYWORDS):
+            continue
+        try:
+            # A native <label> click toggles its wrapped <input> and fires
+            # whatever change handler the site's own JS listens for --
+            # calling .check() directly on a framework-controlled input can
+            # silently no-op (the value snaps back without a real user
+            # event driving it). Falls back to the radio itself if it isn't
+            # label-wrapped (an aria-label'd standalone input instead).
+            label = radio.locator("xpath=ancestor::label[1]")
+            target = label if label.count() else radio
+            target.click(timeout=2000)
+        except PlaywrightError:
+            continue
+        _claim(radio)
+        return True
+    return False
+
+
 def _click_unclaimed_choice_option(page: Page, *, allow_google_oauth: bool = False) -> bool:
     candidates, infos = _scan_clickable(page, _CHOICE_CLICKABLE_SELECTOR)
 
@@ -1212,6 +1295,17 @@ _CAPTCHA_WARNING_PHRASES: tuple[str, ...] = (
     "verify you're human",
     "unusual traffic",
     "captcha verification failed",
+    # Same failure, different wording -- seen live on doxy.me's invisible
+    # reCAPTCHA v3 (no visible challenge widget at all, just the small
+    # corner badge under _captcha_challenge_visible's size floor): a
+    # low-trust-score submission is silently rejected server-side with
+    # "Captcha validation failed. Please try again.", which the exact
+    # "verification failed" phrase above doesn't match. Without this, the
+    # loop kept re-submitting the same form every remaining iteration
+    # (each attempt re-failing the same score check) and eventually
+    # wandered off via the click-chooser fallback instead of recognizing
+    # this as the same dead end a visible CAPTCHA already is.
+    "captcha validation failed",
 )
 
 
@@ -1473,6 +1567,74 @@ def _click_across_frames(page: Page, fn: Callable[[Frame], bool]) -> bool:
         except PlaywrightError:
             continue
     return False
+
+
+_VISION_FILL_INPUT_SELECTOR = (
+    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+    ':not([type="submit"]):not([type="button"]):not([type="file"]), textarea'
+)
+_MAX_VISION_FILL_FIELDS = 8
+
+
+def _unclaimed_visible_inputs(page: Page) -> list[tuple[Locator, str]]:
+    """Every unclaimed, visible text-like input/textarea across all frames
+    (see _fill_across_frames' iframe note above), paired with its hint text
+    (see _input_hint_text) -- the candidate pool for _fill_via_vision_fallback
+    below. A field _fill_visible_fields/_fill_unclaimed_generic_name_fields
+    already recognized and claimed this same iteration is correctly excluded
+    here too, since only genuinely-unrecognized fields need the fallback."""
+    found: list[tuple[Locator, str]] = []
+    for frame in page.frames:
+        try:
+            locator = frame.locator(_VISION_FILL_INPUT_SELECTOR)
+            count = locator.count()
+        except PlaywrightError:
+            continue
+        for i in range(count):
+            if len(found) >= _MAX_VISION_FILL_FIELDS:
+                return found
+            candidate = locator.nth(i)
+            try:
+                if not candidate.is_visible() or _is_claimed(candidate):
+                    continue
+            except PlaywrightError:
+                continue
+            found.append((candidate, _input_hint_text(candidate).strip()))
+    return found
+
+
+def _fill_via_vision_fallback(
+    page: Page, config: Config, candidates: list[tuple[Locator, str]]
+) -> int:
+    """Fill whatever real fields _FIELD_PATTERNS' fixed keyword lists didn't
+    recognize -- an oddly-labelled or fully custom field ("What's your
+    team's goal?", a numeric "Team size", ...) -- via a vision-capable LLM,
+    given the exact unclaimed/visible candidates the caller already scanned
+    (see _unclaimed_visible_inputs). Deliberately tried even when *other*
+    fields on the same page already matched normally: a page can be mostly
+    recognized (email, password) with just one custom field left over, and
+    leaving that one empty can block submission just as surely as an
+    entirely-unrecognized form would. Screenshots the page and asks the
+    model to suggest a plausible value for each field (see
+    vision_fallback.suggest_field_values); returns the number actually
+    filled, 0 if `candidates` is empty or nothing could be parsed out of the
+    model's answer."""
+    if not candidates:
+        return 0
+
+    suggestions = suggest_field_values(page, config, [hint for _, hint in candidates])
+    if not suggestions:
+        return 0
+
+    filled = 0
+    for index, (locator, _hint) in enumerate(candidates):
+        value = suggestions.get(index)
+        if not value:
+            continue
+        if _set_field_value(locator, value):
+            _claim(locator)
+            filled += 1
+    return filled
 
 
 def _switch_to_new_page(page: Page, pages_before: int, store: EvidenceStore, run_id: str) -> Page:
@@ -1789,25 +1951,63 @@ def _run_registration(
             page, lambda f: _fill_unclaimed_generic_name_fields(f, identity)
         )
         checked_boxes = _fill_across_frames(page, _check_consent_checkboxes)
+        # Unconditional, like the fill functions above (not gated behind
+        # "nothing else matched" like the button/link chooser cluster
+        # below): a radiogroup can share a screen with real fillable fields
+        # (e.g. a "Company name" box next to a plan-type picker), and should
+        # get selected either way. See _check_unclaimed_radio_option's
+        # docstring for why this needed its own pass at all.
+        picked_radio = _click_across_frames(page, _check_unclaimed_radio_option)
+
+        if config is not None and vision_attempts < _MAX_VISION_ATTEMPTS:
+            # Try filling any real-but-unrecognized fields via vision before
+            # falling to the click-only chooser logic below -- see
+            # _fill_via_vision_fallback's docstring for why this runs even
+            # when `filled` is already > 0 (some fields matched normally,
+            # one custom one didn't). Cheap to check first: only spends a
+            # Groq round-trip (and vision_attempts' shared budget, also used
+            # by the click-target fallback further down) when there's an
+            # actual unclaimed field left on screen.
+            remaining_inputs = _unclaimed_visible_inputs(page)
+            if remaining_inputs:
+                vision_attempts += 1
+                vision_filled = _fill_via_vision_fallback(page, config, remaining_inputs)
+                if vision_filled:
+                    filled += vision_filled
+                    run_logger.action("vision_fallback_filled", fields=vision_filled)
 
         picked = False
         clicked_email = False
         skipped_prompt = False
-        if filled == 0 and checked_boxes == 0:
-            # Nothing to fill or check -- either an auth-method chooser (see
-            # _click_continue_with_email, tried first so it's always
-            # preferred over an OAuth/SSO button), a dismissible security/
-            # preference prompt (see _click_skip_prompt, e.g. "Set up a
-            # passkey" -- tried next so it's preferred over accidentally
-            # committing to it), or a choice-wizard step (see
+        if filled == 0 and checked_boxes == 0 and not picked_radio:
+            # Nothing to fill, check, or select -- either an auth-method
+            # chooser (see _click_continue_with_email, tried first so it's
+            # always preferred over an OAuth/SSO button), a dismissible
+            # security/preference prompt (see _click_skip_prompt, e.g. "Set
+            # up a passkey" -- tried next so it's preferred over
+            # accidentally committing to it), or a choice-wizard step (see
             # _click_unclaimed_choice_option) rather than a plain form.
+            # Skipped entirely when picked_radio already fired -- same
+            # one-chooser-action-per-iteration discipline as clicked_email/
+            # skipped_prompt below (a radiogroup pick and a button/link pick
+            # both landing in the same iteration risks the second one
+            # clicking the very "Continue" button the radio pick just
+            # enabled, submitting a screen the loop hasn't verified is
+            # actually ready yet).
             clicked_email = _click_across_frames(page, _click_continue_with_email)
             if not clicked_email:
                 skipped_prompt = _click_across_frames(page, _click_skip_prompt)
             if not clicked_email and not skipped_prompt:
                 picked = _click_unclaimed_choice_option(page, allow_google_oauth=allow_google_oauth)
 
-        made_progress = filled > 0 or checked_boxes > 0 or picked or clicked_email or skipped_prompt
+        made_progress = (
+            filled > 0
+            or checked_boxes > 0
+            or picked
+            or picked_radio
+            or clicked_email
+            or skipped_prompt
+        )
         # Clicking "Continue with Email"/a skip prompt only reveals the next
         # screen (see cloudbusinesshq.com/Synder) -- nothing to submit yet.
         # Skip _click_submit this same iteration so it can't find and click
@@ -1830,7 +2030,7 @@ def _run_registration(
         # one the choice-picker actually meant to pick.
         clicked = (
             False
-            if (clicked_email or skipped_prompt or picked)
+            if (clicked_email or skipped_prompt or picked or picked_radio)
             else _click_across_frames(
                 page,
                 partial(

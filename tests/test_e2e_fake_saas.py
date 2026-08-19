@@ -9,12 +9,15 @@ require the resource to actually load).
 """
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import pytest
 
 from growthradar.config import Config
+from growthradar.event_log import read_log
 from growthradar.orchestrator import run_growthradar_session
 from growthradar.report import to_json, to_markdown
 
@@ -143,3 +146,130 @@ def test_full_pipeline_against_fake_saas_site(tmp_path: Path, config: Config) ->
     assert payload["technologies_detected"] == list(report.technologies_detected)
 
     assert outcome.errors == ()
+
+
+class _FakeGroqResponse:
+    """Minimal stand-in for `http.client.HTTPResponse`, matching how
+    vision_fallback.py/llm_summary.py read a `urllib.request.urlopen` result
+    (context manager + `.read()`), used to fake every Groq call below without
+    touching the network."""
+
+    def __init__(self, content: str) -> None:
+        self._data = json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
+
+    def __enter__(self) -> "_FakeGroqResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._data
+
+
+def test_vision_fallback_fills_field_unrecognized_by_dom_heuristics(
+    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A field with no keyword match anywhere in registration.py's
+    _FIELD_PATTERNS (or the generic name-field fallback) -- e.g. a custom
+    "team size" question -- must still get filled via the vision fallback
+    (see registration.py's _fill_via_vision_fallback) instead of being left
+    empty while the DOM-based heuristics silently move on to something else.
+    """
+    vision_config = replace(
+        config, groq_api_key="gsk-test-123", groq_vision_model="qwen/qwen3.6-27b"
+    )
+
+    signup_url = _data_url(
+        _page(
+            "Sign Up",
+            "<div id='signup-form'>"
+            "<input name='email' type='email' placeholder='Email' />"
+            "<input name='team_size' placeholder='How many people are on your team?' />"
+            "<button onclick=\"document.getElementById('signup-form').style.display='none';"
+            "document.body.insertAdjacentHTML("
+            "'beforeend', '<div id=welcome>Welcome aboard!</div>');"
+            '">Sign up</button>'
+            "</div>",
+        )
+    )
+    home_url = _data_url(
+        _page(
+            "Acme",
+            f"<h1>Acme -- Project Management for Teams</h1>"
+            f"<nav><a href='{signup_url}'>Sign up</a></nav>"
+            "<p>Start your free trial today, no credit card required.</p>",
+        )
+    )
+
+    def fake_urlopen(request: Any, timeout: float = 30) -> _FakeGroqResponse:
+        # Every Groq caller in the pipeline (this fallback, llm_summary.py's
+        # narrative) shares the same choices[0].message.content shape and
+        # degrades gracefully on unexpected content (see each module's own
+        # "never raises" contract) -- one canned field-suggestion answer is
+        # enough to exercise the path under test without the others erroring.
+        return _FakeGroqResponse('{"1": "12-20 people"}')
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    outcome = run_growthradar_session(
+        home_url, config=vision_config, run_id="e2e-vision-run", log_dir=tmp_path
+    )
+
+    if any("chrome" in e.lower() and "not found" in e.lower() for e in outcome.errors):
+        pytest.skip(f"Google Chrome not installed: {outcome.errors}")
+
+    assert outcome.registration is not None
+    assert outcome.registration.submitted is True
+
+    entries = list(read_log(tmp_path / "e2e-vision-run.jsonl"))
+    fill_events = [e for e in entries if e.message == "vision_fallback_filled"]
+    assert fill_events, "expected the vision fallback to fire and fill the unrecognized field"
+    assert fill_events[0].data["fields"] == 1
+
+
+def test_radio_group_choice_gates_disabled_submit_button(
+    tmp_path: Path, config: Config
+) -> None:
+    """A native `<input type="radio">` picker gating an otherwise-disabled
+    submit button (seen live on doxy.me: MUI `role="radiogroup"` cards,
+    "I'm a provider" / "I'm a patient") must get selected -- see
+    registration.py's _check_unclaimed_radio_option. Before that function
+    existed, none of the fill/check/click-chooser heuristics recognized a
+    bare radio input, so this screen stalled at steps_completed=0 forever.
+    """
+    signup_url = _data_url(
+        _page(
+            "Sign Up",
+            "<div role='radiogroup'>"
+            "<label><input type='radio' name='user-role' value='provider' "
+            "onclick=\"document.getElementById('continue-btn').disabled=false\">"
+            "<h2>I'm a provider</h2></label>"
+            "<label><input type='radio' name='user-role' value='patient' "
+            "onclick=\"document.getElementById('continue-btn').disabled=false\">"
+            "<h2>I'm a patient</h2></label>"
+            "</div>"
+            "<button id='continue-btn' disabled "
+            "onclick=\"document.body.insertAdjacentHTML("
+            "'beforeend', '<div id=welcome>Welcome aboard!</div>');\">"
+            "Continue</button>",
+        )
+    )
+    home_url = _data_url(
+        _page(
+            "Acme",
+            f"<h1>Acme -- Project Management for Teams</h1>"
+            f"<nav><a href='{signup_url}'>Sign up</a></nav>"
+            "<p>Start your free trial today, no credit card required.</p>",
+        )
+    )
+
+    outcome = run_growthradar_session(
+        home_url, config=config, run_id="e2e-radio-run", log_dir=tmp_path
+    )
+
+    if any("chrome" in e.lower() and "not found" in e.lower() for e in outcome.errors):
+        pytest.skip(f"Google Chrome not installed: {outcome.errors}")
+
+    assert outcome.registration is not None
+    assert outcome.registration.submitted is True
