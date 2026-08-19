@@ -325,3 +325,44 @@ def test_server_side_rejection_after_submit_click_is_not_reported_as_success(
 
     assert outcome.report is not None
     assert outcome.report.registration_completed is False
+
+
+def test_consent_checkbox_with_no_label_association_still_gets_checked() -> None:
+    """A mandatory "I agree to the Terms of Service" checkbox whose caption
+    is a plain sibling <div> -- no `<label for="...">`, no wrapping
+    `<label>` at all -- must still get checked (seen live on
+    invoice.2go.com/sign-up/: exactly this markup, a real accessibility
+    anti-pattern -- the checkbox and its "By continuing, you agree..."
+    caption are unrelated sibling <div>s under a shared container). Before
+    this, `_checkbox_label_text` read as empty for such a checkbox,
+    `_check_consent_checkboxes` skipped it outright, and the site's own
+    "Required" validation blocked submission forever even though every
+    other field was filled correctly.
+
+    Exercises the DOM helpers directly (not the full pipeline) since the
+    thing under test -- whether the checkbox ends up checked -- isn't
+    otherwise observable from `run_growthradar_session`'s result once the
+    browser has closed.
+    """
+    from patchright.sync_api import sync_playwright
+
+    from growthradar.registration import _check_consent_checkboxes
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"Google Chrome not installed: {exc}")
+        page = browser.new_page()
+        page.set_content(
+            "<div class='consent-row'>"
+            "<div class='checkbox-wrap'><input type='checkbox' id='agreeTerms' /></div>"
+            "<div>By continuing, you agree to the Terms of Service &amp; Privacy Policy</div>"
+            "</div>"
+        )
+
+        checked = _check_consent_checkboxes(page.main_frame)
+
+        assert checked == 1
+        assert page.locator("#agreeTerms").is_checked() is True
+        browser.close()

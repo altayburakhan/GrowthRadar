@@ -119,6 +119,15 @@ _SUBMIT_BUTTON_TEXTS: tuple[str, ...] = (
     "Get started",
     "Start trial",
     "Start free trial",
+    # Seen live on invoice.2go.com's actual signup button -- distinct
+    # wording from "Start free trial" above (no shared words at all under
+    # word-subset matching), so needed its own entry rather than being
+    # caught by an existing phrase. Without this, the button fell through
+    # to _click_unclaimed_choice_option instead of _click_submit -- it
+    # still got clicked, but `submitted` never reflected that (only
+    # _click_submit's own path sets it), so a real click looked identical
+    # in the report to nothing having been clicked at all.
+    "Try it free",
     "Register",
     "Submit",
 )
@@ -473,7 +482,31 @@ def _checkbox_label_text(checkbox: Locator) -> str:
             "el => {"
             ' const byFor = el.id && document.querySelector(`label[for="${el.id}"]`);'
             " const wrap = el.closest('label');"
-            " return (byFor && byFor.innerText) || (wrap && wrap.innerText) || ''; }"
+            " if (byFor) return byFor.innerText;"
+            " if (wrap) return wrap.innerText;"
+            # Neither association exists at all -- seen live on
+            # invoice.2go.com/sign-up/: the "I agree" checkbox and its "By
+            # continuing, you agree to the Terms of Service & Privacy
+            # Policy" caption are unrelated sibling <div>s under a shared
+            # container, with no <label for> and no wrapping <label>
+            # anywhere (an accessibility anti-pattern, but a real one) --
+            # left unhandled, this checkbox's label read as empty and
+            # _check_consent_checkboxes skipped it outright, leaving the
+            # "Required" gate blocking submission forever. Walk up a few
+            # ancestors and take the first one whose own text is non-empty
+            # and short enough to plausibly BE just this checkbox's
+            # caption, not an entire unrelated section of the page --
+            # ancestor text only grows monotonically longer going up, so
+            # once one level's text already exceeds that bound, no
+            # further ancestor can be shorter and the search gives up.
+            " let node = el.parentElement;"
+            " for (let i = 0; i < 4 && node; i++) {"
+            "   const t = (node.innerText || '').trim();"
+            "   if (t.length > 300) break;"
+            "   if (t) return t;"
+            "   node = node.parentElement;"
+            " }"
+            " return ''; }"
         )
         return str(text or "")
     except PlaywrightError:
@@ -1404,6 +1437,14 @@ _REGISTRATION_REJECTION_PHRASES: tuple[str, ...] = (
     "already in use",
     "already taken",
     "account with this email",
+    # Seen live on invoice.2go.com: a generic "Sign Up Registration Failed"
+    # banner, most likely from the site's own bot/fraud-detection layer
+    # (ThreatMetrix device fingerprinting + invisible reCAPTCHA both load on
+    # that page) rather than a field-validation issue -- same
+    # can't-solve-it ceiling as a CAPTCHA, but with no fixed challenge
+    # widget to detect the way _captcha_challenge_visible does. Specific
+    # enough not to appear on a genuine success screen.
+    "registration failed",
 )
 
 
