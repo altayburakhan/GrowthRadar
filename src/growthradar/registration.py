@@ -1384,6 +1384,40 @@ def _phone_verification_required(page: Page) -> bool:
     return any(phrase in body_text for phrase in _PHONE_VERIFICATION_PHRASES)
 
 
+# _click_submit only knows a click landed, not what the site did with it --
+# a click that lands on a form the site's own server-side validation then
+# rejects looks identical to one that actually succeeded (submitted=True
+# either way) unless the resulting page is checked for the site's own error
+# copy. Seen live on doxy.me: this project's fixed registrant email (see
+# Config.registrant_email) collided with an account it had already created
+# on an earlier run, and "User already exists, try resetting your password."
+# stayed on screen right after the click -- yet steps_completed/submitted
+# reported a clean success. Deliberately narrow (unlike, say, a generic
+# "please try again", which shows up in enough unrelated contexts --
+# temporary loading states, unrelated widgets -- to false-positive on a
+# genuinely successful screen): only the well-known "this account/address
+# already exists" family, which essentially never appears except as this
+# exact rejection.
+_REGISTRATION_REJECTION_PHRASES: tuple[str, ...] = (
+    "already exists",
+    "already registered",
+    "already in use",
+    "already taken",
+    "account with this email",
+)
+
+
+def _registration_rejection_reason(page: Page) -> str | None:
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000).lower()
+    except PlaywrightError:
+        return None
+    for phrase in _REGISTRATION_REJECTION_PHRASES:
+        if phrase in body_text:
+            return phrase
+    return None
+
+
 def _click_by_exact_text(page: Page, text: str) -> bool:
     """Click the visible, unclaimed clickable element whose text exactly
     matches `text` -- used only for a vision-fallback suggestion (see
@@ -1637,6 +1671,23 @@ def _fill_via_vision_fallback(
     return filled
 
 
+def _capture_registration_step(
+    page: Page, store: EvidenceStore, run_id: str, step_number: int
+) -> None:
+    """One screenshot per completed registration step (radio picked, form
+    submitted, OAuth button clicked, ...), not just the before/after pair
+    `_run_registration` already took. Without this, a multi-step wizard's
+    intermediate screens (seen live on doxy.me: the "I'm a provider"/"I'm a
+    patient" picker, then the actual email/password form, then a "Check your
+    email" confirmation) were invisible in the report -- only the very first
+    and very last screen were ever captured, so there was no visual evidence
+    of what happened in between, or proof a later step (e.g. an email
+    verification prompt) was ever reached at all."""
+    capture_and_record(
+        page, store, run_id, ScreenshotKind.REGISTRATION, f"registration step {step_number}"
+    )
+
+
 def _switch_to_new_page(page: Page, pages_before: int, store: EvidenceStore, run_id: str) -> Page:
     """If the last click opened a new tab/window (page.context.pages grew),
     continue on the newest one instead of the stale original.
@@ -1857,6 +1908,7 @@ def _run_registration(
     phone_verification_required = False
     code_verification_attempted = False
     verification_code_entered = False
+    rejection_reason: str | None = None
     # An externally-supplied deadline (orchestrator.py's shared session
     # budget) takes priority; falling back to this call's own standalone
     # budget only when nothing shared was provided (e.g. tests, or
@@ -1908,6 +1960,12 @@ def _run_registration(
             page = _switch_to_new_page(page, pages_before, store, run_logger.run_id)
             wait_for_stable(page)
             submitted = True
+            _capture_registration_step(page, store, run_logger.run_id, steps_completed)
+            rejection_reason = _registration_rejection_reason(page)
+            if rejection_reason:
+                run_logger.error(f"registration rejected by target site: {rejection_reason!r}")
+                submitted = False
+                break
             continue
 
         if (
@@ -1942,6 +2000,15 @@ def _run_registration(
                 wait_for_stable(page)
                 if clicked:
                     submitted = True
+                _capture_registration_step(page, store, run_logger.run_id, steps_completed)
+                if submitted:
+                    rejection_reason = _registration_rejection_reason(page)
+                    if rejection_reason:
+                        run_logger.error(
+                            f"registration rejected by target site: {rejection_reason!r}"
+                        )
+                        submitted = False
+                        break
                 continue
             run_logger.error("verification code not received or code field not found")
 
@@ -2113,6 +2180,7 @@ def _run_registration(
                     run_logger.action("vision_fallback_clicked", text=suggestion)
                     wait_for_stable(page)
                     steps_completed += 1
+                    _capture_registration_step(page, store, run_logger.run_id, steps_completed)
                     continue
                 run_logger.action("vision_fallback_no_target", attempt=vision_attempts)
             break
@@ -2121,10 +2189,17 @@ def _run_registration(
 
         if not clicked:
             wait_for_stable(page)
+            _capture_registration_step(page, store, run_logger.run_id, steps_completed)
             continue
 
         wait_for_stable(page)
         submitted = True
+        _capture_registration_step(page, store, run_logger.run_id, steps_completed)
+        rejection_reason = _registration_rejection_reason(page)
+        if rejection_reason:
+            run_logger.error(f"registration rejected by target site: {rejection_reason!r}")
+            submitted = False
+            break
 
     capture_and_record(
         page,
@@ -2177,6 +2252,7 @@ def _run_registration(
             "verification_code_entered": verification_code_entered,
             "email_verification_required": email_verification_required,
             "phone_verification_required": phone_verification_required,
+            "rejection_reason": rejection_reason,
             "email": identity.email,
             "company_name": identity.company_name,
             "country": identity.country,
@@ -2191,6 +2267,11 @@ def _run_registration(
         email_verification_required=email_verification_required,
         phone_verification_required=phone_verification_required,
         verification_code_entered=verification_code_entered,
+        error=(
+            f"registration rejected by target site: {rejection_reason}"
+            if rejection_reason
+            else None
+        ),
     )
 
 

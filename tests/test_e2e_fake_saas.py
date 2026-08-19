@@ -273,3 +273,55 @@ def test_radio_group_choice_gates_disabled_submit_button(
 
     assert outcome.registration is not None
     assert outcome.registration.submitted is True
+
+
+def test_server_side_rejection_after_submit_click_is_not_reported_as_success(
+    tmp_path: Path, config: Config
+) -> None:
+    """A submit click that lands but gets rejected by the site's own
+    validation (seen live on doxy.me: "User already exists, try resetting
+    your password.", caused by this project's fixed registrant email
+    colliding with an account it had already created on an earlier run)
+    must not be reported as a successful registration -- see
+    registration.py's _registration_rejection_reason. Before this existed,
+    `_click_submit` reporting a landed click was the only signal used:
+    steps_completed/submitted came back exactly as if the account had
+    actually been created, with no way to tell the two apart from the
+    report alone.
+    """
+    signup_url = _data_url(
+        _page(
+            "Sign Up",
+            "<div id='signup-form'>"
+            "<input name='email' type='email' placeholder='Email' />"
+            "<button onclick=\"document.getElementById('signup-form')."
+            "insertAdjacentHTML('beforeend', "
+            "'<div class=error>An account with this email already exists. "
+            "Try resetting your password.</div>');\">"
+            "Sign up</button>"
+            "</div>",
+        )
+    )
+    home_url = _data_url(
+        _page(
+            "Acme",
+            f"<h1>Acme -- Project Management for Teams</h1>"
+            f"<nav><a href='{signup_url}'>Sign up</a></nav>"
+            "<p>Start your free trial today, no credit card required.</p>",
+        )
+    )
+
+    outcome = run_growthradar_session(
+        home_url, config=config, run_id="e2e-rejection-run", log_dir=tmp_path
+    )
+
+    if any("chrome" in e.lower() and "not found" in e.lower() for e in outcome.errors):
+        pytest.skip(f"Google Chrome not installed: {outcome.errors}")
+
+    assert outcome.registration is not None
+    assert outcome.registration.submitted is False
+    assert outcome.registration.error is not None
+    assert "already exists" in outcome.registration.error
+
+    assert outcome.report is not None
+    assert outcome.report.registration_completed is False
